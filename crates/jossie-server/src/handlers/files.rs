@@ -26,9 +26,7 @@ pub async fn download_file(
         .get_file_record(&file_id)
         .await?
         .ok_or_else(|| AppError::not_found(anyhow::anyhow!("File not found")))?;
-    let data = tokio::fs::read(&record.path)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let data = state.db.read_file_data(&record).await?;
     let filename = record
         .name
         .chars()

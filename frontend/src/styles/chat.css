@@ -523,6 +523,33 @@
   color: #8995a3;
   font-size: 0.65rem;
 }
+.secretary-approval label {
+  display: grid;
+  gap: 0.35rem;
+  color: #d4bb73;
+  font-size: 0.65rem;
+}
+.secretary-approval textarea {
+  width: 100%;
+  min-height: 7rem;
+  padding: 0.65rem;
+  resize: vertical;
+  border: 1px solid #4b4d3d;
+  border-radius: 0.55rem;
+  background: #171812;
+  color: #edf1e8;
+  line-height: 1.5;
+}
+.secretary-composer-note {
+  margin: 0 1rem 1rem;
+  padding: 0.8rem;
+  border: 1px solid #4b4531;
+  border-radius: 0.75rem;
+  background: #191a17;
+  color: #aeb7c0;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
 .chat-action-error {
   margin: 0 1rem 0.6rem;
   padding: 0.65rem 0.75rem;

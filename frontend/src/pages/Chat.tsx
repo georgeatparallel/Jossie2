@@ -15,6 +15,7 @@ import {
   listConversations,
   listPendingActions,
   rejectAction,
+  updateSecretaryDraft,
   updateConversation,
   uploadFile,
 } from '../api'
@@ -613,7 +614,7 @@ export function Chat({
     )
     try {
       if (approve) {
-        await approveAction(api, action.id)
+        await approveAction(api, action.id, action.revision)
       } else {
         await rejectAction(api, action.id)
       }
@@ -625,6 +626,27 @@ export function Chat({
           : 'Unable to resolve the action.',
       )
       if (activeId) await refreshConversation(activeId)
+    }
+  }
+
+  const updateDraft = async (action: PendingAction, text: string) => {
+    setActionError(null)
+    try {
+      const updated = await updateSecretaryDraft(
+        api,
+        action.id,
+        text,
+        action.revision,
+      )
+      setPendingActions((actions) =>
+        actions.map((item) => (item.id === updated.id ? updated : item)),
+      )
+    } catch (reason) {
+      setActionError(
+        reason instanceof Error ? reason.message : 'Unable to update the draft.',
+      )
+      if (activeId) await refreshConversation(activeId)
+      throw reason
     }
   }
 
@@ -687,6 +709,9 @@ export function Chat({
               onClick={() => chooseThread(conversation)}
             >
               <strong>{conversation.title || 'Untitled conversation'}</strong>
+              {conversation.kind === 'telegram_secretary' && (
+                <small>Secretary-managed Telegram chat</small>
+              )}
               {conversation.preview && <span>{conversation.preview}</span>}
               <small>
                 {relativeDate(conversation.updated_at)}
@@ -825,7 +850,13 @@ export function Chat({
                   className={`message ${message.role}${message.id === focusMessageId ? ' focused' : ''}`}
                 >
                   <span className="message-author">
-                    {message.role === 'user' ? 'You' : 'Jossie'}
+                    {activeConversation?.kind === 'telegram_secretary'
+                      ? message.role === 'user'
+                        ? activeConversation.title || 'Telegram contact'
+                        : 'You'
+                      : message.role === 'user'
+                        ? 'You'
+                        : 'Jossie'}
                   </span>
                   <div className="message-body">
                     <ReactMarkdown>{message.content}</ReactMarkdown>
@@ -897,16 +928,21 @@ export function Chat({
             runs={activeRuns}
             actions={pendingActions}
             onDecision={(action, approve) => void decide(action, approve)}
+            onDraftUpdate={updateDraft}
           />
           {actionError && (
             <p className="chat-action-error" role="alert">
               {actionError}
             </p>
           )}
-          <form
-            className="composer-new"
-            onSubmit={(event) => void submit(event)}
-          >
+          {activeConversation?.kind === 'telegram_secretary' ? (
+            <div className="secretary-composer-note">
+              Jossie drafts replies here. Edit and approve the exact text above,
+              or reply to the draft notification in Telegram with revision
+              instructions.
+            </div>
+          ) : (
+          <form className="composer-new" onSubmit={(event) => void submit(event)}>
             <div className="attachment-row">
               {files.map((file) => (
                 <span
@@ -978,6 +1014,7 @@ export function Chat({
               </button>
             </div>
           </form>
+          )}
           {sending && activeId && (
             <button
               className="cancel-run"

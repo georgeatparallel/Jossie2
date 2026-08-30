@@ -8,7 +8,9 @@ export type Attachment = { id: string, name: string, mime_type: string | null, s
 
 export type Message = { id: string, conversation_id: string, role: Role, content: string, tool_calls: JsonValue | null, tool_call_id: string | null, name: string | null, attachments: Array<Attachment> | null, created_at: string, };
 
-export type Conversation = { id: string, title: string | null, archived_at: string | null, created_at: string, updated_at: string, };
+export type ConversationKind = "assistant" | "telegram_secretary";
+
+export type Conversation = { id: string, title: string | null, kind: ConversationKind, archived_at: string | null, created_at: string, updated_at: string, };
 
 export type ToolCall = { id: string, name: string, arguments: string, };
 
@@ -16,7 +18,7 @@ export type OnboardingField = { name: string, label: string, input_type: string,
 
 export type OnboardingStatus = { "status": "Configured" } | { "status": "RequiresAction", "details": { fields: Array<OnboardingField>, } };
 
-export type ConversationListItem = { preview: string | null, matched_message_id: string | null, message_count: number, id: string, title: string | null, archived_at: string | null, created_at: string, updated_at: string, };
+export type ConversationListItem = { preview: string | null, matched_message_id: string | null, message_count: number, id: string, title: string | null, kind: ConversationKind, archived_at: string | null, created_at: string, updated_at: string, };
 
 export type ChatImport = { id: string, file_id: string, format: string, status: string, total_messages: number, analyzed_messages: number, memories_saved: number, nodes_saved: number, edges_saved: number, error: string | null, created_at: string, updated_at: string, };
 
@@ -28,7 +30,7 @@ export type MemoryEntryWithMetadata = { key: string, content: string, tags: stri
 
 export type ActivityEvent = { id: string, conversation_id: string | null, run_id: string | null, category: string, title: string, detail: string | null, tone: string, created_at: string, };
 
-export type PendingAction = { id: string, batch_id: string, conversation_id: string, run_id: string, call_id: string, tool_name: string, title: string, summary: string, effect: string, status: string, result_error: string | null, created_at: string, updated_at: string, resolved_at: string | null, };
+export type PendingAction = { id: string, batch_id: string, conversation_id: string, run_id: string, call_id: string, tool_name: string, title: string, summary: string, effect: string, kind: string, editable_text: string | null, revision: number, resume_on_resolve: boolean, source_revision: number | null, status: string, result_error: string | null, created_at: string, updated_at: string, resolved_at: string | null, };
 
 export type ScheduledTask = { id: string, conversation_id: string, task_type: string, task_data: JsonValue, schedule_type: string, schedule_value: string, status: string, next_run_at: string | null, last_run_at: string | null, run_count: number, max_runs: number | null, created_at: string, updated_at: string, last_error: string | null, };
 

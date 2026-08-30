@@ -246,7 +246,7 @@ impl ChatExportImporter {
             .ok_or_else(|| anyhow::anyhow!("File not found: {file_id}"))?;
         ensure!(file.size <= MAX_EXPORT_BYTES, "Chat export is too large");
 
-        let bytes = tokio::fs::read(&file.path).await?;
+        let bytes = self.db.read_file_data(&file).await?;
         let content = String::from_utf8(bytes)
             .context("Chat export is not UTF-8 text. Export it as TXT or JSON before importing.")?;
         let requested_format = parse_format_name(&import.format);

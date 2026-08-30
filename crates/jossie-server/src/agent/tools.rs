@@ -305,7 +305,7 @@ async fn hydrate_attachment_payloads(state: &AppState, messages: &mut [Message])
                 continue;
             }
         };
-        match tokio::fs::read(&record.path).await {
+        match state.db.read_file_data(&record).await {
             Ok(data) if data.len() <= remaining => {
                 remaining -= data.len();
                 attachment.data = Some(std::sync::Arc::from(data));
@@ -983,6 +983,10 @@ async fn partition_authorized_calls(
                 title,
                 summary,
                 effect: effect_name(metadata.effect).to_string(),
+                kind: "tool_call".to_string(),
+                editable_text: None,
+                resume_on_resolve: true,
+                source_revision: None,
             })
             .await?;
         emit_stream_event(

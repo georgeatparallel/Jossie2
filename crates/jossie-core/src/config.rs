@@ -289,6 +289,8 @@ pub struct TelegramConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_user_id: Option<i64>,
+    #[serde(default)]
+    pub secretary_enabled: bool,
     #[serde(default = "default_telegram_max_download_bytes")]
     pub max_download_bytes: usize,
     #[serde(default = "default_telegram_ffmpeg_path")]
@@ -300,6 +302,7 @@ impl Default for TelegramConfig {
         Self {
             bot_token: String::new(),
             allowed_user_id: None,
+            secretary_enabled: false,
             max_download_bytes: default_telegram_max_download_bytes(),
             ffmpeg_path: default_telegram_ffmpeg_path(),
         }

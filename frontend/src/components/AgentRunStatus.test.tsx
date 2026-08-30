@@ -13,6 +13,11 @@ const action: PendingAction = {
   title: 'Send email',
   summary: 'To ada@example.com — Status update\nThe migration is complete.',
   effect: 'external_write',
+  kind: 'tool_call',
+  editable_text: null,
+  revision: 1,
+  resume_on_resolve: true,
+  source_revision: null,
   status: 'pending',
   created_at: '2026-08-02T12:00:00Z',
   updated_at: '2026-08-02T12:00:00Z',
@@ -25,7 +30,14 @@ afterEach(cleanup)
 describe('AgentRunStatus', () => {
   it('shows safe action details and dispatches an approval', () => {
     const decide = vi.fn()
-    render(<AgentRunStatus steps={[]} actions={[action]} onDecision={decide} />)
+    render(
+      <AgentRunStatus
+        steps={[]}
+        actions={[action]}
+        onDecision={decide}
+        onDraftUpdate={vi.fn()}
+      />,
+    )
     expect(screen.getByText('ada@example.com', { exact: false })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
     expect(decide).toHaveBeenCalledWith(action, true)
@@ -39,6 +51,7 @@ describe('AgentRunStatus', () => {
           { ...action, status: 'uncertain', result_error: 'Outcome unknown' },
         ]}
         onDecision={() => undefined}
+        onDraftUpdate={vi.fn()}
       />,
     )
     expect(screen.getByText('Using mail search')).toBeTruthy()
@@ -75,9 +88,43 @@ describe('AgentRunStatus', () => {
         ]}
         actions={[]}
         onDecision={() => undefined}
+        onDraftUpdate={vi.fn()}
       />,
     )
     expect(screen.getByText('Checking the calendar')).toBeTruthy()
     expect(screen.getByText('Working')).toBeTruthy()
+  })
+
+  it('requires secretary draft edits to be saved before exact-text approval', () => {
+    const decide = vi.fn()
+    const update = vi.fn().mockResolvedValue(undefined)
+    const secretary = {
+      ...action,
+      kind: 'telegram_secretary_reply',
+      editable_text: 'Tomorrow works for me.',
+      title: 'Reply to Ada',
+    }
+    render(
+      <AgentRunStatus
+        steps={[]}
+        actions={[secretary]}
+        onDecision={decide}
+        onDraftUpdate={update}
+      />,
+    )
+    const approve = screen.getByRole('button', {
+      name: 'Approve exact text',
+    }) as HTMLButtonElement
+    expect(approve.disabled).toBe(false)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Exact text to send' }), {
+      target: { value: 'Could we meet tomorrow afternoon?' },
+    })
+    expect(approve.disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Save edit' }))
+    expect(update).toHaveBeenCalledWith(
+      secretary,
+      'Could we meet tomorrow afternoon?',
+    )
+    expect(decide).not.toHaveBeenCalled()
   })
 })

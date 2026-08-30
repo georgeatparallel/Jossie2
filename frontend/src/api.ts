@@ -361,14 +361,29 @@ export const listPendingActions = (
     `/api/actions/pending${conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : ''}`,
   )
 
-export const approveAction = (config: ApiConfig, actionId: string) =>
+export const approveAction = (
+  config: ApiConfig,
+  actionId: string,
+  revision?: number,
+) =>
   request<{ action_id: string; status: string }>(
     config,
-    `/api/actions/${actionId}/approve`,
+    `/api/actions/${actionId}/approve${revision != null ? `?revision=${revision}` : ''}`,
     {
       method: 'POST',
     },
   )
+
+export const updateSecretaryDraft = (
+  config: ApiConfig,
+  actionId: string,
+  text: string,
+  expectedRevision: number,
+) =>
+  request<PendingAction>(config, `/api/actions/${actionId}/draft`, {
+    method: 'PATCH',
+    body: JSON.stringify({ text, expected_revision: expectedRevision }),
+  })
 
 export const rejectAction = (config: ApiConfig, actionId: string) =>
   request<{ action_id: string; status: string }>(

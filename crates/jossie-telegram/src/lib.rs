@@ -1,3 +1,4 @@
+use anyhow::Context;
 use jossie_core::types::{Attachment, Message as JossieMessage, Role};
 use jossie_server::AppState;
 use jossie_server::events::ServerEvent;
@@ -12,8 +13,8 @@ use teloxide::errors::ApiError;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{
-    CallbackQuery, ChatAction, FileId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId,
-    ReplyParameters,
+    BusinessConnectionId, CallbackQuery, ChatAction, FileId, InlineKeyboardButton,
+    InlineKeyboardMarkup, MessageId, ReplyParameters,
 };
 use teloxide::update_listeners::{self, UpdateListener};
 use teloxide::utils::command::BotCommands;
@@ -30,6 +31,7 @@ include!("commands.rs");
 include!("turns.rs");
 include!("media.rs");
 include!("delivery.rs");
+include!("secretary.rs");
 #[cfg(test)]
 mod tests {
     use super::*;

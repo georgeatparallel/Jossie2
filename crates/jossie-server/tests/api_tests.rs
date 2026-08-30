@@ -69,8 +69,11 @@ async fn setup_app() -> axum::Router {
         },
         telegram: TelegramRuntimeConfig {
             token: "".to_string(),
+            allowed_user_id: None,
+            secretary_enabled: false,
             max_download_bytes: 20_000_000,
             ffmpeg_path: "ffmpeg".to_string(),
+            secretary_sender: None,
         },
         background: BackgroundRuntimeConfig {
             heartbeat_enabled: false,

@@ -181,10 +181,11 @@ async fn build_user_content(
 ) -> anyhow::Result<String> {
     let caption = messages
         .iter()
-        .find_map(|message| message.caption().or_else(|| message.text()))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+        .filter_map(|message| message.caption().or_else(|| message.text()))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut transcripts = Vec::new();
     for item in media
         .iter()
@@ -296,6 +297,41 @@ async fn persist_media_message(
                 item.size as i64,
                 item.path.to_string_lossy().as_ref(),
                 Some(message.conversation_id),
+            )
+            .await
+        {
+            for id in saved {
+                let _ = state.db.delete_file_record(&id).await;
+            }
+            return Err(error);
+        }
+        saved.push(item.id);
+    }
+    jossie_server::events::persist_message(state, message).await?;
+    Ok(())
+}
+
+async fn persist_sensitive_media_message(
+    state: &AppState,
+    message: &JossieMessage,
+    media: &[LocalMedia],
+) -> anyhow::Result<()> {
+    let mut saved = Vec::new();
+    for item in media {
+        state
+            .db
+            .encrypt_file_at_rest(item.path.to_string_lossy().as_ref())
+            .await?;
+        if let Err(error) = state
+            .db
+            .save_file_record_with_encryption(
+                &item.id,
+                &item.name,
+                Some(&item.mime_type),
+                item.size as i64,
+                item.path.to_string_lossy().as_ref(),
+                Some(message.conversation_id),
+                true,
             )
             .await
         {

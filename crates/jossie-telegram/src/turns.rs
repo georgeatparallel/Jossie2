@@ -184,9 +184,12 @@ fn pending_keyboard(actions: &[jossie_db::PendingAction]) -> InlineKeyboardMarku
         vec![
             InlineKeyboardButton::callback(
                 format!("Approve: {}", action.title),
-                format!("pa:y:{}", action.id),
+                format!("pa:y:{}:{}", action.id, action.revision),
             ),
-            InlineKeyboardButton::callback("Reject", format!("pa:n:{}", action.id)),
+            InlineKeyboardButton::callback(
+                "Reject",
+                format!("pa:n:{}:{}", action.id, action.revision),
+            ),
         ]
     }))
 }
@@ -451,7 +454,7 @@ async fn handle_callback(
         let _ = bot.answer_callback_query(query.id).await;
         return;
     };
-    let mut parts = data.splitn(3, ':');
+    let mut parts = data.split(':');
     if parts.next() != Some("pa") {
         let _ = bot.answer_callback_query(query.id).await;
         return;
@@ -468,6 +471,7 @@ async fn handle_callback(
         let _ = bot.answer_callback_query(query.id).await;
         return;
     };
+    let expected_revision = parts.next().and_then(|value| value.parse::<i64>().ok());
     let Some(origin) = query.message.as_ref() else {
         let _ = bot.answer_callback_query(query.id).await;
         return;
@@ -483,10 +487,11 @@ async fn handle_callback(
         return;
     }
     let typing = spawn_typing(bot.clone(), chat_id);
-    let result = jossie_server::handlers::actions::decide_action_deferred(
+    let result = jossie_server::handlers::actions::decide_action_deferred_at_revision(
         state.clone(),
         action_id.to_string(),
         approve,
+        expected_revision,
     )
     .await;
     let _ = bot.answer_callback_query(query.id).await;
@@ -549,6 +554,18 @@ async fn handle_callback(
                 }
             } else {
                 let _ = typing.send(());
+                let acknowledgement = match outcome.response.status.as_str() {
+                    "completed" => "Sent.",
+                    "rejected" => "Draft rejected.",
+                    "failed" => "I couldn't send that draft. Please review the connection and try again.",
+                    _ => "Draft updated.",
+                };
+                let _ = bot
+                    .send_message(chat_id, acknowledgement)
+                    .reply_parameters(
+                        ReplyParameters::new(message_id).allow_sending_without_reply(),
+                    )
+                    .await;
             }
         }
         Err(error) => {

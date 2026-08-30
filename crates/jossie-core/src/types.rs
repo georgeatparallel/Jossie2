@@ -145,9 +145,40 @@ impl Message {
 pub struct Conversation {
     pub id: Uuid,
     pub title: Option<String>,
+    #[serde(default)]
+    pub kind: ConversationKind,
     pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationKind {
+    #[default]
+    Assistant,
+    TelegramSecretary,
+}
+
+impl ConversationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Assistant => "assistant",
+            Self::TelegramSecretary => "telegram_secretary",
+        }
+    }
+}
+
+impl std::str::FromStr for ConversationKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "assistant" => Ok(Self::Assistant),
+            "telegram_secretary" => Ok(Self::TelegramSecretary),
+            other => Err(format!("unknown conversation kind: {other}")),
+        }
+    }
 }
 
 #[cfg(test)]

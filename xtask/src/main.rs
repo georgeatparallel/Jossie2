@@ -22,6 +22,7 @@ fn generated_contracts() -> String {
         jossie_core::types::Role,
         jossie_core::types::Attachment,
         jossie_core::types::Message,
+        jossie_core::types::ConversationKind,
         jossie_core::types::Conversation,
         jossie_core::integration::ToolCall,
         jossie_core::integration::OnboardingField,

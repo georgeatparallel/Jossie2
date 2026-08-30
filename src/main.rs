@@ -34,6 +34,20 @@ async fn main() -> Result<()> {
     }
 
     let config = config::load("config.toml")?;
+    if config.telegram.secretary_enabled {
+        anyhow::ensure!(
+            config.telegram.allowed_user_id.is_some(),
+            "telegram.secretary_enabled requires telegram.allowed_user_id"
+        );
+        anyhow::ensure!(
+            !config.database.encryption_key.trim().is_empty(),
+            "telegram.secretary_enabled requires database.encryption_key"
+        );
+        anyhow::ensure!(
+            !config.telegram.bot_token.trim().is_empty(),
+            "telegram.secretary_enabled requires telegram.bot_token"
+        );
+    }
 
     tracing::info!("Connecting to database...");
     let db = Database::new_with_encryption_key(
@@ -199,6 +213,7 @@ async fn main() -> Result<()> {
         );
     }
 
+    let (secretary_tx, secretary_rx) = tokio::sync::mpsc::channel(32);
     let state = Arc::new(AppState {
         db: db.clone(),
         llm,
@@ -238,8 +253,11 @@ async fn main() -> Result<()> {
         },
         telegram: TelegramRuntimeConfig {
             token: config.telegram.bot_token.clone(),
+            allowed_user_id: config.telegram.allowed_user_id,
+            secretary_enabled: config.telegram.secretary_enabled,
             max_download_bytes: config.telegram.max_download_bytes,
             ffmpeg_path: config.telegram.ffmpeg_path.clone(),
+            secretary_sender: config.telegram.secretary_enabled.then_some(secretary_tx),
         },
         background: BackgroundRuntimeConfig {
             heartbeat_enabled: config.heartbeat.enabled,
@@ -262,6 +280,7 @@ async fn main() -> Result<()> {
             &config.telegram.bot_token,
             state.clone(),
             config.telegram.allowed_user_id,
+            config.telegram.secretary_enabled.then_some(secretary_rx),
         );
         tokio::spawn(async move {
             if let Err(e) = bot.run().await {

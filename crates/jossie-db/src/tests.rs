@@ -1003,6 +1003,10 @@ async fn pending_action_lifecycle_is_atomic_and_private() {
             title: "Send email".to_string(),
             summary: "To owner@example.com".to_string(),
             effect: "external_write".to_string(),
+            kind: "tool_call".to_string(),
+            editable_text: None,
+            resume_on_resolve: true,
+            source_revision: None,
         })
         .await
         .unwrap();
@@ -1046,6 +1050,10 @@ async fn interrupted_actions_become_uncertain_without_retrying() {
             title: "Send email".to_string(),
             summary: "External action".to_string(),
             effect: "external_write".to_string(),
+            kind: "tool_call".to_string(),
+            editable_text: None,
+            resume_on_resolve: true,
+            source_revision: None,
         })
         .await
         .unwrap();
@@ -1060,6 +1068,161 @@ async fn interrupted_actions_become_uncertain_without_retrying() {
         Some("call-2")
     );
     assert!(messages.last().unwrap().content.contains("uncertain"));
+}
+
+#[tokio::test]
+async fn secretary_data_is_encrypted_revisioned_and_purged() {
+    let db = Database::new_with_encryption_key("sqlite::memory:", Some("secretary-test-key"))
+        .await
+        .unwrap();
+    db.migrate().await.unwrap();
+    let rights = serde_json::json!({"can_reply": true});
+    db.upsert_telegram_business_connection(
+        "connection-1",
+        42,
+        42,
+        &rights,
+        true,
+        "2026-08-30T12:00:00Z",
+    )
+    .await
+    .unwrap();
+    let chat = db
+        .get_or_create_telegram_business_chat("connection-1", 99, "Ada Lovelace", Some("ada"))
+        .await
+        .unwrap();
+    let message = Message::new(
+        chat.conversation_id,
+        Role::User,
+        "Can we meet tomorrow?".to_string(),
+    );
+    db.save_message(&message).await.unwrap();
+    db.record_telegram_business_message(
+        "connection-1",
+        99,
+        7,
+        message.id,
+        "inbound",
+        "2026-08-30T12:01:00Z",
+    )
+    .await
+    .unwrap();
+
+    let raw = sqlx::query_scalar::<_, String>("SELECT content FROM messages WHERE id = ?")
+        .bind(message.id.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(raw.starts_with("enc:v1:"));
+    assert!(!raw.contains("meet tomorrow"));
+    let loaded = db.get_messages(chat.conversation_id, None).await.unwrap();
+    assert_eq!(loaded[0].content, "Can we meet tomorrow?");
+
+    let file_id = Uuid::new_v4();
+    let file_path = std::env::temp_dir().join(format!("jossie-secretary-{file_id}.bin"));
+    fs::write(&file_path, b"private attachment bytes").unwrap();
+    db.encrypt_file_at_rest(file_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    db.save_file_record_with_encryption(
+        &file_id,
+        "private-agenda.txt",
+        Some("text/plain"),
+        24,
+        file_path.to_string_lossy().as_ref(),
+        Some(chat.conversation_id),
+        true,
+    )
+    .await
+    .unwrap();
+    let raw_name = sqlx::query_scalar::<_, String>("SELECT name FROM files WHERE id = ?")
+        .bind(file_id.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(raw_name.starts_with("enc:v1:"));
+    assert!(
+        !fs::read(&file_path)
+            .unwrap()
+            .windows(b"private attachment bytes".len())
+            .any(|window| window == b"private attachment bytes")
+    );
+    let file = db.get_file_record(&file_id).await.unwrap().unwrap();
+    assert_eq!(file.name, "private-agenda.txt");
+    assert_eq!(
+        db.read_file_data(&file).await.unwrap(),
+        b"private attachment bytes"
+    );
+
+    let current = db
+        .get_telegram_business_chat("connection-1", 99)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.transcript_revision, 1);
+    let action = db
+        .create_pending_action(&NewPendingAction {
+            batch_id: "secretary-batch".to_string(),
+            conversation_id: chat.conversation_id,
+            run_id: "secretary-run".to_string(),
+            call_id: "secretary-call".to_string(),
+            tool_name: "telegram_secretary_reply".to_string(),
+            arguments: "{}".to_string(),
+            title: "Reply to Ada".to_string(),
+            summary: "Calendar availability was consulted".to_string(),
+            effect: "external_write".to_string(),
+            kind: "telegram_secretary_reply".to_string(),
+            editable_text: Some("Tomorrow works for me.".to_string()),
+            resume_on_resolve: false,
+            source_revision: Some(1),
+        })
+        .await
+        .unwrap();
+    let raw_draft =
+        sqlx::query_scalar::<_, String>("SELECT editable_text FROM pending_actions WHERE id = ?")
+            .bind(&action.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(raw_draft.starts_with("enc:v1:"));
+    let raw_title =
+        sqlx::query_scalar::<_, String>("SELECT title FROM pending_actions WHERE id = ?")
+            .bind(&action.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(raw_title.starts_with("enc:v1:"));
+    assert!(!raw_title.contains("Ada"));
+    let revised = db
+        .update_secretary_draft(&action.id, "How about tomorrow?", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(revised.revision, 2);
+    assert_eq!(
+        revised.editable_text.as_deref(),
+        Some("How about tomorrow?")
+    );
+    assert!(
+        db.update_secretary_draft(&action.id, "stale", 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let paths = db
+        .purge_telegram_business_connection("connection-1")
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![file_path.to_string_lossy().to_string()]);
+    fs::remove_file(file_path).unwrap();
+    assert!(
+        db.get_conversation(chat.conversation_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(db.get_pending_action(&action.id).await.unwrap().is_none());
 }
 
 #[tokio::test]

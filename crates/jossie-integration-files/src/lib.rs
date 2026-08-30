@@ -85,7 +85,7 @@ impl Integration for FilesIntegration {
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("File not found: {}", args.file_id))?;
 
-                let content = tokio::fs::read_to_string(&record.path).await?;
+                let content = String::from_utf8(self.db.read_file_data(&record).await?)?;
                 // Truncation is handled by IntegrationRegistry, but we can do a sanity check here too
                 Ok(content)
             }

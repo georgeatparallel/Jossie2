@@ -67,8 +67,8 @@
     #[test]
     fn callback_data_stays_within_telegram_limit() {
         let id = Uuid::new_v4().to_string();
-        assert!(format!("pa:y:{id}").len() <= 64);
-        assert!(format!("pa:n:{id}").len() <= 64);
+        assert!(format!("pa:y:{id}:1").len() <= 64);
+        assert!(format!("pa:n:{id}:1").len() <= 64);
     }
 
     #[test]

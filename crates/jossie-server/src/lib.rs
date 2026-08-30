@@ -5,7 +5,9 @@ pub mod handlers;
 pub mod middleware;
 pub mod state;
 
-pub use agent::{prepend_system_prompt, run_agent_loop};
+pub use agent::{
+    create_secretary_draft, prepend_system_prompt, revise_secretary_draft, run_agent_loop,
+};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -15,7 +17,8 @@ use axum::{
 };
 pub use events::ServerEvent;
 pub use state::{
-    AgentRuntimeConfig, AppState, BackgroundRuntimeConfig, TelegramRuntimeConfig, WebRuntimeConfig,
+    AgentRuntimeConfig, AppState, BackgroundRuntimeConfig, TelegramRuntimeConfig,
+    TelegramSecretaryCommand, TelegramSecretarySendResult, WebRuntimeConfig,
 };
 use std::sync::Arc;
 use tower::limit::ConcurrencyLimitLayer;
@@ -118,6 +121,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/actions/{id}/reject",
             post(handlers::actions::reject_action),
         )
+        .route(
+            "/api/actions/{id}/draft",
+            patch(handlers::actions::update_secretary_draft),
+        )
+        .route("/api/telegram/secretary", get(handlers::secretary::status))
         // Config / Onboarding
         .route(
             "/api/onboarding",

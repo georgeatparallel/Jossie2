@@ -204,6 +204,9 @@ fn override_config_from_env(config: &mut AppConfig) {
     if let Ok(val) = env::var("JOSSIE_TELEGRAM_BOT_TOKEN") {
         config.telegram.bot_token = val.trim().to_string();
     }
+    if let Some(parsed) = env_parse("JOSSIE_TELEGRAM_SECRETARY_ENABLED") {
+        config.telegram.secretary_enabled = parsed;
+    }
     if let Some(parsed) = env_parse("JOSSIE_TELEGRAM_MAX_DOWNLOAD_BYTES") {
         config.telegram.max_download_bytes = parsed;
     }

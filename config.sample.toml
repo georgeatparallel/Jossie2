@@ -242,6 +242,11 @@ bot_token = ""
 # Leave commented out to allow any user to chat with the bot
 # allowed_user_id = 123456789
 
+# Let this bot act as a review-first secretary for the allowed user's selected
+# private chats. Also enable Secretary Mode for the bot in @BotFather.
+# Requires allowed_user_id and database.encryption_key.
+secretary_enabled = false
+
 # Telegram's hosted Bot API currently limits downloads to 20 MB.
 # Lower this value if you want a stricter local limit; larger values are clamped.
 max_download_bytes = 20000000
@@ -356,6 +361,7 @@ interval_seconds = 14400
 #    - JOSSIE_LLM_SYSTEM_PROMPT
 #    - JOSSIE_LLM_SERVICE_TIER
 #    - JOSSIE_TELEGRAM_BOT_TOKEN
+#    - JOSSIE_TELEGRAM_SECRETARY_ENABLED
 #    - JOSSIE_EMAIL_USERNAME, JOSSIE_EMAIL_PASSWORD
 #    - JOSSIE_GOOGLE_CLIENT_ID, JOSSIE_GOOGLE_CLIENT_SECRET
 #    - JOSSIE_DATABASE_ENCRYPTION_KEY

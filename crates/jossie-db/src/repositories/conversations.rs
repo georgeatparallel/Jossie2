@@ -3,15 +3,31 @@ use super::*;
 impl Database {
     // Conversations
     pub async fn create_conversation(&self, title: Option<&str>) -> anyhow::Result<Conversation> {
+        self.create_conversation_with_kind(title, ConversationKind::Assistant)
+            .await
+    }
+
+    pub async fn create_conversation_with_kind(
+        &self,
+        title: Option<&str>,
+        kind: ConversationKind,
+    ) -> anyhow::Result<Conversation> {
         let id = Uuid::new_v4();
         let now = Utc::now();
         let id_str = id.to_string();
         let now_str = now.to_rfc3339();
+        let stored_title = match (kind, title) {
+            (ConversationKind::TelegramSecretary, Some(title)) => {
+                Some(self.protect_sensitive_data(title)?)
+            }
+            (_, title) => title.map(str::to_string),
+        };
         sqlx::query(
-            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO conversations (id, title, kind, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&id_str)
-        .bind(title)
+        .bind(stored_title)
+        .bind(kind.as_str())
         .bind(&now_str)
         .bind(&now_str)
         .execute(&self.pool)
@@ -19,6 +35,7 @@ impl Database {
         Ok(Conversation {
             id,
             title: title.map(String::from),
+            kind,
             archived_at: None,
             created_at: now,
             updated_at: now,
@@ -28,21 +45,23 @@ impl Database {
     pub async fn get_conversation(&self, id: Uuid) -> anyhow::Result<Option<Conversation>> {
         let id_str = id.to_string();
         let row = sqlx::query_as::<_, ConversationRow>(
-            "SELECT id, title, archived_at, created_at, updated_at FROM conversations WHERE id = ?",
+            "SELECT id, title, kind, archived_at, created_at, updated_at FROM conversations WHERE id = ?",
         )
         .bind(&id_str)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(Conversation::try_from).transpose()
+        row.map(|row| self.conversation_from_row(row)).transpose()
     }
 
     pub async fn list_conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         let rows = sqlx::query_as::<_, ConversationRow>(
-            "SELECT id, title, archived_at, created_at, updated_at FROM conversations WHERE archived_at IS NULL ORDER BY updated_at DESC, id DESC",
+            "SELECT id, title, kind, archived_at, created_at, updated_at FROM conversations WHERE archived_at IS NULL ORDER BY updated_at DESC, id DESC",
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(Conversation::try_from).collect()
+        rows.into_iter()
+            .map(|row| self.conversation_from_row(row))
+            .collect()
     }
 
     pub async fn list_conversation_items(
@@ -60,7 +79,7 @@ impl Database {
         let pattern = format!("%{escaped}%");
         let before = before.map(|id| id.to_string());
         let rows = sqlx::query_as::<_, ConversationListRow>(
-            "SELECT c.id, c.title, c.archived_at, c.created_at, c.updated_at,
+            "SELECT c.id, c.title, c.kind, c.archived_at, c.created_at, c.updated_at,
                     COALESCE(
                       (SELECT substr(m.content, 1, 240) FROM messages m
                        WHERE m.conversation_id = c.id
@@ -111,9 +130,22 @@ impl Database {
         .bind(limit.clamp(1, 100) as i64)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(ConversationListItem::try_from)
-            .collect()
+        let mut items = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            let kind: ConversationKind = row.kind.parse().map_err(anyhow::Error::msg)?;
+            if kind == ConversationKind::TelegramSecretary {
+                row.title = row
+                    .title
+                    .map(|value| self.unprotect_sensitive_data(&value))
+                    .transpose()?;
+                row.preview = row
+                    .preview
+                    .map(|value| self.unprotect_sensitive_data(&value))
+                    .transpose()?;
+            }
+            items.push(ConversationListItem::try_from(row)?);
+        }
+        Ok(items)
     }
 
     pub async fn update_conversation(
@@ -127,6 +159,16 @@ impl Database {
         };
         let now = Utc::now().to_rfc3339();
         if let Some(title) = title {
+            let kind = self
+                .get_conversation(id)
+                .await?
+                .map(|conversation| conversation.kind)
+                .unwrap_or_default();
+            let title = if kind == ConversationKind::TelegramSecretary {
+                self.protect_sensitive_data(title)?
+            } else {
+                title.to_string()
+            };
             sqlx::query("UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?")
                 .bind(title)
                 .bind(&now)
@@ -143,6 +185,17 @@ impl Database {
                 .await?;
         }
         self.get_conversation(id).await
+    }
+
+    fn conversation_from_row(&self, mut row: ConversationRow) -> anyhow::Result<Conversation> {
+        let kind: ConversationKind = row.kind.parse().map_err(anyhow::Error::msg)?;
+        if kind == ConversationKind::TelegramSecretary {
+            row.title = row
+                .title
+                .map(|title| self.unprotect_sensitive_data(&title))
+                .transpose()?;
+        }
+        Conversation::try_from(row)
     }
 
     pub async fn conversation_has_active_dependencies(&self, id: Uuid) -> anyhow::Result<bool> {
@@ -287,13 +340,25 @@ impl Database {
         let id_str = msg.id.to_string();
         let conv_str = msg.conversation_id.to_string();
         let role_str = msg.role.to_string();
+        let secretary =
+            sqlx::query_scalar::<_, String>("SELECT kind FROM conversations WHERE id = ?")
+                .bind(&conv_str)
+                .fetch_optional(&mut *tx)
+                .await?
+                .as_deref()
+                == Some(ConversationKind::TelegramSecretary.as_str());
+        let content = if secretary {
+            self.protect_sensitive_data(&msg.content)?
+        } else {
+            msg.content.clone()
+        };
         let tc = msg.tool_calls.as_ref().map(|v| v.to_string());
         let created = msg.created_at.to_rfc3339();
         sqlx::query("INSERT INTO messages (id, conversation_id, role, content, tool_calls, tool_call_id, name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&id_str)
             .bind(&conv_str)
             .bind(&role_str)
-            .bind(&msg.content)
+            .bind(&content)
             .bind(&tc)
             .bind(&msg.tool_call_id)
             .bind(&msg.name)
@@ -308,7 +373,8 @@ impl Database {
             .execute(&mut *tx)
             .await?;
 
-        if msg.role == Role::User
+        if !secretary
+            && msg.role == Role::User
             && msg.name.is_none()
             && let Some(title) = Self::conversation_title_from_content(&msg.content)
         {
@@ -444,6 +510,14 @@ impl Database {
         let mut messages = Vec::new();
         for row in rows {
             let mut msg = Message::try_from(row)?;
+            let kind =
+                sqlx::query_scalar::<_, String>("SELECT kind FROM conversations WHERE id = ?")
+                    .bind(msg.conversation_id.to_string())
+                    .fetch_one(&self.pool)
+                    .await?;
+            if kind == ConversationKind::TelegramSecretary.as_str() {
+                msg.content = self.unprotect_sensitive_data(&msg.content)?;
+            }
             let attachments = attachments_by_message.remove(&msg.id).unwrap_or_default();
             if !attachments.is_empty() {
                 msg.attachments = Some(
@@ -473,7 +547,7 @@ impl Database {
         }
         let mut builder = QueryBuilder::<Sqlite>::new(
             "SELECT ma.message_id, f.id, f.name, f.mime_type, f.size, f.path,
-                    f.conversation_id, f.created_at
+                    f.conversation_id, f.created_at, f.encrypted
              FROM message_attachments ma
              INNER JOIN files f ON f.id = ma.file_id
              WHERE ma.message_id IN (",
@@ -499,7 +573,7 @@ impl Database {
             by_message
                 .entry(message_id)
                 .or_default()
-                .push(FileRecord::try_from(row)?);
+                .push(self.decode_file_record(FileRecord::try_from(row)?)?);
         }
         Ok(by_message)
     }

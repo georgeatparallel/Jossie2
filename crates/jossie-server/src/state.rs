@@ -5,7 +5,7 @@ use jossie_integration_mail::MailIntegration;
 use jossie_llm::LlmClient;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -43,8 +43,26 @@ pub struct WebRuntimeConfig {
 
 pub struct TelegramRuntimeConfig {
     pub token: String,
+    pub allowed_user_id: Option<i64>,
+    pub secretary_enabled: bool,
     pub max_download_bytes: usize,
     pub ffmpeg_path: String,
+    pub secretary_sender: Option<mpsc::Sender<TelegramSecretaryCommand>>,
+}
+
+#[derive(Debug)]
+pub struct TelegramSecretaryCommand {
+    pub business_connection_id: String,
+    pub chat_id: i64,
+    pub reply_to_message_id: Option<i32>,
+    pub text: String,
+    pub response: oneshot::Sender<anyhow::Result<TelegramSecretarySendResult>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TelegramSecretarySendResult {
+    pub message_id: i32,
+    pub sent_at: chrono::DateTime<chrono::Utc>,
 }
 
 pub struct BackgroundRuntimeConfig {

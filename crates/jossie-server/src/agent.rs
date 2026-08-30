@@ -1,5 +1,6 @@
 use crate::events::{ServerEvent, persist_message, preview_text};
 use crate::state::AppState;
+use anyhow::Context;
 use futures::FutureExt;
 use jossie_core::events::{
     CALENDAR_EVENT, CALENDAR_EVENT_BATCH, CALENDAR_EVENT_UPDATED, GMAIL_NEW_MESSAGE,
@@ -19,6 +20,7 @@ use uuid::Uuid;
 
 include!("agent/goal_tracking.rs");
 include!("agent/prompt_context.rs");
+include!("agent/secretary.rs");
 include!("agent/tools.rs");
 include!("agent/run.rs");
 include!("agent/streaming.rs");

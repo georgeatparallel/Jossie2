@@ -390,13 +390,13 @@ pub async fn persist_work_event(db: &jossie_db::Database, event: &ServerEvent) -
                 run_id,
                 action,
             } => {
-                db.update_work_run(
-                    run_id,
-                    WorkRunStatus::WaitingForApproval,
-                    Some(&action.title),
-                    None,
-                )
-                .await?;
+                let phase = if action.kind == "telegram_secretary_reply" {
+                    "Review Telegram secretary draft"
+                } else {
+                    &action.title
+                };
+                db.update_work_run(run_id, WorkRunStatus::WaitingForApproval, Some(phase), None)
+                    .await?;
                 if let Some(run) = db.get_work_run(run_id).await? {
                     derived.push(ServerEvent::WorkRunUpdated {
                         conversation_id: Some(*conversation_id),
@@ -582,14 +582,18 @@ pub async fn persist_activity_event(db: &jossie_db::Database, event: &ServerEven
             conversation_id,
             run_id,
             action,
-        } => Some((
-            Some(*conversation_id),
-            Some(run_id.as_str()),
-            "approval",
-            "Waiting for approval",
-            Some(action.title.as_str()),
-            "warn",
-        )),
+        } => {
+            let detail =
+                (action.kind != "telegram_secretary_reply").then_some(action.title.as_str());
+            Some((
+                Some(*conversation_id),
+                Some(run_id.as_str()),
+                "approval",
+                "Waiting for approval",
+                detail,
+                "warn",
+            ))
+        }
         ServerEvent::ActionResolved {
             conversation_id,
             run_id,

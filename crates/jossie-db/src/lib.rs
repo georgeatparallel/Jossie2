@@ -5,7 +5,7 @@ use aes_gcm::{
 use anyhow::Context;
 use base64::Engine;
 use chrono::{Duration, Utc};
-use jossie_core::types::{Conversation, Message, Role};
+use jossie_core::types::{Conversation, ConversationKind, Message, Role};
 use sha2::{Digest, Sha256};
 use sqlx::QueryBuilder;
 use sqlx::Row;
@@ -83,6 +83,55 @@ impl Database {
             "enc:v1:{}",
             base64::engine::general_purpose::STANDARD.encode(payload)
         ))
+    }
+
+    pub fn sensitive_data_encryption_enabled(&self) -> bool {
+        self.account_cipher.is_some()
+    }
+
+    pub fn protect_sensitive_data(&self, plaintext: &str) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.account_cipher.is_some(),
+            "database.encryption_key is required for Telegram secretary data"
+        );
+        self.protect_account_data(plaintext)
+    }
+
+    pub fn unprotect_sensitive_data(&self, stored: &str) -> anyhow::Result<String> {
+        self.unprotect_account_data(stored)
+    }
+
+    pub fn protect_sensitive_bytes(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let cipher = self
+            .account_cipher
+            .as_ref()
+            .context("database.encryption_key is required for Telegram secretary attachments")?;
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce, plaintext)
+            .map_err(|_| anyhow::anyhow!("Unable to encrypt sensitive attachment"))?;
+        let mut payload = b"JOSSIE-ENC-V1\0".to_vec();
+        payload.extend(nonce);
+        payload.extend(ciphertext);
+        Ok(payload)
+    }
+
+    pub fn unprotect_sensitive_bytes(&self, stored: &[u8]) -> anyhow::Result<Vec<u8>> {
+        const PREFIX: &[u8] = b"JOSSIE-ENC-V1\0";
+        let payload = stored
+            .strip_prefix(PREFIX)
+            .context("Encrypted attachment header is invalid")?;
+        anyhow::ensure!(
+            payload.len() > 12,
+            "Encrypted attachment payload is invalid"
+        );
+        let cipher = self
+            .account_cipher
+            .as_ref()
+            .context("Encrypted attachment requires database.encryption_key")?;
+        cipher
+            .decrypt((&payload[..12]).into(), &payload[12..])
+            .map_err(|_| anyhow::anyhow!("Unable to decrypt sensitive attachment"))
     }
 
     fn unprotect_account_data(&self, stored: &str) -> anyhow::Result<String> {
@@ -174,6 +223,7 @@ impl Database {
         let pragma = match table {
             "conversations" => "PRAGMA table_info(conversations)",
             "memory_metadata" => "PRAGMA table_info(memory_metadata)",
+            "files" => "PRAGMA table_info(files)",
             _ => anyhow::bail!("Unsupported legacy table inspection: {table}"),
         };
         let rows = sqlx::query(pragma).fetch_all(&self.pool).await?;
@@ -226,11 +276,17 @@ impl Database {
                 size INTEGER NOT NULL,
                 path TEXT NOT NULL,
                 conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                encrypted INTEGER NOT NULL DEFAULT 0
             )",
         )
         .execute(&self.pool)
         .await?;
+        if !self.table_has_column("files", "encrypted").await? {
+            sqlx::query("ALTER TABLE files ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0")
+                .execute(&self.pool)
+                .await?;
+        }
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS message_attachments (
                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -408,6 +464,8 @@ mod memory;
 mod memory_prompt;
 #[path = "repositories/scheduler.rs"]
 mod scheduler;
+#[path = "repositories/telegram_secretary.rs"]
+mod telegram_secretary;
 
 fn backup_path_for(path: &Path) -> PathBuf {
     let file_name = path
@@ -459,6 +517,8 @@ pub struct FileRecord {
     pub path: String,
     pub conversation_id: Option<Uuid>,
     pub created_at: String,
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
@@ -501,6 +561,7 @@ struct FileRow {
     path: String,
     conversation_id: Option<String>,
     created_at: String,
+    encrypted: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -513,6 +574,7 @@ struct MessageAttachmentFileRow {
     path: String,
     conversation_id: Option<String>,
     created_at: String,
+    encrypted: bool,
 }
 
 impl TryFrom<FileRow> for FileRecord {
@@ -530,6 +592,7 @@ impl TryFrom<FileRow> for FileRecord {
                 .map(|id| id.parse().context("invalid file conversation id"))
                 .transpose()?,
             created_at: r.created_at,
+            encrypted: r.encrypted,
         })
     }
 }
@@ -549,6 +612,7 @@ impl TryFrom<MessageAttachmentFileRow> for FileRecord {
                 .map(|id| id.parse().context("invalid attachment conversation id"))
                 .transpose()?,
             created_at: r.created_at,
+            encrypted: r.encrypted,
         })
     }
 }
@@ -694,10 +758,59 @@ pub struct TelegramChatLink {
     pub conversation_id: Uuid,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TelegramBusinessConnection {
+    pub id: String,
+    pub owner_user_id: i64,
+    pub owner_chat_id: i64,
+    pub rights: serde_json::Value,
+    pub is_enabled: bool,
+    pub connected_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TelegramBusinessChat {
+    pub connection_id: String,
+    pub telegram_chat_id: i64,
+    pub conversation_id: Uuid,
+    pub peer_name: String,
+    pub peer_username: Option<String>,
+    pub transcript_revision: i64,
+    pub last_inbound_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct TelegramBusinessConnectionRow {
+    id: String,
+    owner_user_id: i64,
+    owner_chat_id: i64,
+    rights_json: String,
+    is_enabled: bool,
+    connected_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct TelegramBusinessChatRow {
+    connection_id: String,
+    telegram_chat_id: i64,
+    conversation_id: String,
+    peer_name: String,
+    peer_username: Option<String>,
+    transcript_revision: i64,
+    last_inbound_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
 #[derive(sqlx::FromRow)]
 struct ConversationRow {
     id: String,
     title: Option<String>,
+    kind: String,
     archived_at: Option<String>,
     created_at: String,
     updated_at: String,
@@ -707,6 +820,7 @@ struct ConversationRow {
 struct ConversationListRow {
     id: String,
     title: Option<String>,
+    kind: String,
     archived_at: Option<String>,
     created_at: String,
     updated_at: String,
@@ -768,6 +882,7 @@ impl TryFrom<ConversationRow> for Conversation {
         Ok(Conversation {
             id: r.id.parse().context("invalid conversation id")?,
             title: r.title,
+            kind: r.kind.parse().map_err(anyhow::Error::msg)?,
             archived_at: r
                 .archived_at
                 .map(|value| value.parse().context("invalid conversation archived_at"))
@@ -791,6 +906,7 @@ impl TryFrom<ConversationListRow> for ConversationListItem {
         let conversation = Conversation::try_from(ConversationRow {
             id: row.id,
             title: row.title,
+            kind: row.kind,
             archived_at: row.archived_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -906,6 +1022,10 @@ pub struct NewPendingAction {
     pub title: String,
     pub summary: String,
     pub effect: String,
+    pub kind: String,
+    pub editable_text: Option<String>,
+    pub resume_on_resolve: bool,
+    pub source_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
@@ -922,6 +1042,11 @@ pub struct PendingAction {
     pub title: String,
     pub summary: String,
     pub effect: String,
+    pub kind: String,
+    pub editable_text: Option<String>,
+    pub revision: i64,
+    pub resume_on_resolve: bool,
+    pub source_revision: Option<i64>,
     pub status: String,
     pub result_error: Option<String>,
     pub created_at: String,
@@ -941,6 +1066,11 @@ struct PendingActionRow {
     title: String,
     summary: String,
     effect: String,
+    kind: String,
+    editable_text: Option<String>,
+    revision: i64,
+    resume_on_resolve: bool,
+    source_revision: Option<i64>,
     status: String,
     result_error: Option<String>,
     created_at: String,
@@ -966,6 +1096,11 @@ impl TryFrom<PendingActionRow> for PendingAction {
             title: row.title,
             summary: row.summary,
             effect: row.effect,
+            kind: row.kind,
+            editable_text: row.editable_text,
+            revision: row.revision,
+            resume_on_resolve: row.resume_on_resolve,
+            source_revision: row.source_revision,
             status: row.status,
             result_error: row.result_error,
             created_at: row.created_at,

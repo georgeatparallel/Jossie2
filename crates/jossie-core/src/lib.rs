@@ -9,4 +9,4 @@ pub use integration::{
     Integration, IntegrationRegistry, ResultQuality, ToolCall, ToolDefinition, ToolErrorKind,
     ToolResult, classify_error, validate_tool_result,
 };
-pub use types::{Conversation, Message, Role};
+pub use types::{Conversation, ConversationKind, Message, Role};
