@@ -324,9 +324,11 @@ async fn notify_owner_of_secretary_draft(
     action: &jossie_db::PendingAction,
 ) -> anyhow::Result<MessageId> {
     let draft = action.editable_text.as_deref().unwrap_or_default();
-    let text = format!(
-        "Draft reply to {}\n\n{}\n\n{}\n\nSecretary draft {}",
-        chat.peer_name, draft, action.summary, action.id
+    let text = secretary_draft_notification_text(
+        &chat.peer_name,
+        draft,
+        &action.summary,
+        &action.id,
     );
     let can_reply = connection
         .rights
@@ -346,6 +348,17 @@ async fn notify_owner_of_secretary_draft(
         .reply_markup(keyboard)
         .await?;
     Ok(message.id)
+}
+
+fn secretary_draft_notification_text(
+    peer_name: &str,
+    draft: &str,
+    summary: &str,
+    action_id: &str,
+) -> String {
+    format!(
+        "Here’s a possible reply to {peer_name}:\n\n{draft}\n\n{summary}\n\nUse the buttons to send it exactly as written or reject it. Reply to this message if you want me to rewrite it.\n\nSecretary draft {action_id}"
+    )
 }
 
 async fn handle_edited_secretary_message(

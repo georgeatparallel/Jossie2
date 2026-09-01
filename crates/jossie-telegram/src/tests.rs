@@ -72,6 +72,21 @@
     }
 
     #[test]
+    fn secretary_notification_is_conversational_and_keeps_revision_marker() {
+        let text = secretary_draft_notification_text(
+            "Laura",
+            "Klar",
+            "A short reply fits here.",
+            "action-1",
+        );
+
+        assert!(text.starts_with("Here’s a possible reply to Laura:\n\nKlar"));
+        assert!(text.contains("send it exactly as written"));
+        assert!(text.contains("Reply to this message if you want me to rewrite it."));
+        assert!(text.ends_with("Secretary draft action-1"));
+    }
+
+    #[test]
     fn goal_status_reads_like_conversation_not_internal_state() {
         let goal = sample_goal("blocked", false);
         let status = conversational_goal_status(Some(&goal));

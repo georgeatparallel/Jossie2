@@ -8,6 +8,16 @@ mod tests {
     }
 
     #[test]
+    fn secretary_prompt_matches_the_owners_chat_voice() {
+        assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("Write as the owner"));
+        assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("spelling"));
+        assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("emoji frequency"));
+        assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("shortest natural continuation"));
+        assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("genuinely ambiguous"));
+        assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("do not invent a confident interpretation"));
+    }
+
+    #[test]
     fn test_sanitize_removes_orphan_tool() {
         let mut msgs = vec![make_msg(Role::Tool), make_msg(Role::User)];
         sanitize_context_window(&mut msgs);
