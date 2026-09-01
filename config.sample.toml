@@ -244,6 +244,8 @@ bot_token = ""
 
 # Let this bot act as a review-first secretary for the allowed user's selected
 # private chats. Also enable Secretary Mode for the bot in @BotFather.
+# Telegram delivers new managed-chat messages only; it does not backfill chat
+# history from before the connection was active.
 # Requires allowed_user_id and database.encryption_key.
 secretary_enabled = false
 

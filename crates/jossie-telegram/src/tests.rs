@@ -205,3 +205,60 @@
         assert!(stopped_at >= 2);
         assert_eq!(calls.load(Ordering::SeqCst), stopped_at);
     }
+
+    #[tokio::test]
+    async fn business_message_recovers_a_missed_secretary_connection() {
+        use axum::{Json, Router};
+        use serde_json::json;
+
+        async fn business_connection() -> Json<serde_json::Value> {
+            Json(json!({
+                "ok": true,
+                "result": {
+                    "id": "connection-1",
+                    "user": {
+                        "id": 42,
+                        "is_bot": false,
+                        "first_name": "Owner"
+                    },
+                    "user_chat_id": 42,
+                    "date": 1_700_000_000,
+                    "rights": {"can_reply": true},
+                    "is_enabled": true
+                }
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(business_connection))
+                .await
+                .unwrap()
+        });
+
+        let db = jossie_db::Database::new_with_encryption_key(
+            "sqlite::memory:",
+            Some("secretary-recovery-test-key"),
+        )
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let bot = Bot::new("TEST").set_api_url(format!("http://{address}/").parse().unwrap());
+
+        let connection = resolve_secretary_connection(&bot, &db, true, Some(42), "connection-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(connection.id, "connection-1");
+        assert_eq!(connection.owner_user_id, 42);
+        assert_eq!(connection.rights["can_reply"], true);
+        assert!(connection.is_enabled);
+        assert!(
+            db.get_telegram_business_connection("connection-1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }

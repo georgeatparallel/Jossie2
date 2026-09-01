@@ -25,50 +25,26 @@ async fn handle_secretary_connection(
     connection: teloxide::types::BusinessConnection,
     notify_owner: bool,
 ) {
-    if !state.telegram.secretary_enabled {
-        return;
-    }
-    let owner_user_id = connection.user.id.0 as i64;
-    if state.telegram.allowed_user_id != Some(owner_user_id) {
-        tracing::warn!(owner_user_id, "Ignoring Telegram secretary connection from a non-owner");
-        return;
-    }
-    let connection_id = connection.id.0.clone();
-    if !connection.is_enabled {
-        match state
-            .db
-            .purge_telegram_business_connection(&connection_id)
-            .await
-        {
-            Ok(paths) => {
-                for path in paths {
-                    let _ = tokio::fs::remove_file(path).await;
-                }
-            }
-            Err(error) => {
-                tracing::error!(connection_id, "Failed to purge disconnected secretary data: {error}");
-            }
-        }
-        return;
-    }
-    let rights = serde_json::to_value(connection.rights.as_ref()).unwrap_or_default();
-    let connected_at = connection.date.to_rfc3339();
-    if let Err(error) = state
-        .db
-        .upsert_telegram_business_connection(
-            &connection_id,
-            owner_user_id,
-            connection.user_chat_id.0 as i64,
-            &rights,
-            true,
-            &connected_at,
-        )
-        .await
+    let saved = match apply_secretary_connection(
+        &state.db,
+        state.telegram.secretary_enabled,
+        state.telegram.allowed_user_id,
+        &connection,
+    )
+    .await
     {
-        tracing::error!(connection_id, "Failed to save Telegram secretary connection: {error}");
+        Ok(saved) => saved,
+        Err(error) => {
+            let connection_id = connection.id.0;
+            tracing::error!(connection_id, "Failed to save Telegram secretary connection: {error}");
+            return;
+        }
+    };
+    let Some(saved) = saved else {
         return;
-    }
-    let can_reply = rights
+    };
+    let can_reply = saved
+        .rights
         .get("can_reply")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
@@ -79,9 +55,49 @@ async fn handle_secretary_connection(
     };
     if notify_owner {
         let _ = bot
-            .send_message(ChatId(connection.user_chat_id.0 as i64), text)
+            .send_message(ChatId(saved.owner_chat_id), text)
             .await;
     }
+}
+
+async fn apply_secretary_connection(
+    db: &jossie_db::Database,
+    secretary_enabled: bool,
+    allowed_user_id: Option<i64>,
+    connection: &teloxide::types::BusinessConnection,
+) -> anyhow::Result<Option<jossie_db::TelegramBusinessConnection>> {
+    if !secretary_enabled {
+        return Ok(None);
+    }
+    let owner_user_id = connection.user.id.0 as i64;
+    if allowed_user_id != Some(owner_user_id) {
+        tracing::warn!(owner_user_id, "Ignoring Telegram secretary connection from a non-owner");
+        return Ok(None);
+    }
+    let connection_id = connection.id.0.clone();
+    if !connection.is_enabled {
+        let paths = db
+            .purge_telegram_business_connection(&connection_id)
+            .await?;
+        for path in paths {
+            if let Err(error) = tokio::fs::remove_file(&path).await {
+                tracing::warn!(path, "Failed to remove disconnected secretary attachment: {error}");
+            }
+        }
+        return Ok(None);
+    }
+    let rights = serde_json::to_value(connection.rights.as_ref()).unwrap_or_default();
+    let connected_at = connection.date.to_rfc3339();
+    db.upsert_telegram_business_connection(
+        &connection_id,
+        owner_user_id,
+        connection.user_chat_id.0 as i64,
+        &rights,
+        true,
+        &connected_at,
+    )
+    .await
+    .map(Some)
 }
 
 async fn queue_secretary_message(
@@ -97,16 +113,27 @@ async fn queue_secretary_message(
     else {
         return;
     };
-    let Some(connection) = state
-        .db
-        .get_telegram_business_connection(&connection_id)
-        .await
-        .ok()
-        .flatten()
-        .filter(|connection| connection.is_enabled)
-    else {
-        tracing::warn!(connection_id, "Ignoring message for unknown secretary connection");
-        return;
+    let connection = match resolve_secretary_connection(
+        &bot,
+        &state.db,
+        state.telegram.secretary_enabled,
+        state.telegram.allowed_user_id,
+        &connection_id,
+    )
+    .await
+    {
+        Ok(Some(connection)) => connection,
+        Ok(None) => {
+            tracing::warn!(connection_id, "Ignoring message for an unavailable secretary connection");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                connection_id,
+                "Failed to recover secretary connection for business message: {error:#}"
+            );
+            return;
+        }
     };
     let inbound = message
         .from
@@ -139,6 +166,36 @@ async fn queue_secretary_message(
             tracing::error!("Telegram secretary message processing failed: {error:#}");
         }
     });
+}
+
+/// A business-message update can arrive even when Telegram's earlier
+/// business-connection update was not available to this bot process. Telegram
+/// expects bots to recover that metadata from the connection ID carried by the
+/// message instead of dropping the message.
+async fn resolve_secretary_connection(
+    bot: &Bot,
+    db: &jossie_db::Database,
+    secretary_enabled: bool,
+    allowed_user_id: Option<i64>,
+    connection_id: &str,
+) -> anyhow::Result<Option<jossie_db::TelegramBusinessConnection>> {
+    if let Some(connection) = db
+        .get_telegram_business_connection(connection_id)
+        .await?
+        .filter(|connection| connection.is_enabled)
+    {
+        return Ok(Some(connection));
+    }
+
+    tracing::info!(
+        connection_id,
+        "Recovering secretary connection from an incoming business message"
+    );
+    let connection = bot
+        .get_business_connection(BusinessConnectionId(connection_id.to_string()))
+        .await
+        .context("Telegram could not resolve the business connection")?;
+    apply_secretary_connection(db, secretary_enabled, allowed_user_id, &connection).await
 }
 
 async fn process_secretary_messages(
