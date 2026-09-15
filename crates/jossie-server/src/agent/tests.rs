@@ -399,24 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_email_reads_require_urgent_high_confidence_decisions() {
-        let mut decision = EventModeResponse {
-            action: "notify".to_string(),
-            message: "Security alert".to_string(),
-            what_happened: "A security warning arrived".to_string(),
-            why_now: "The account may be at risk".to_string(),
-            what_changed: "A new sign-in was reported".to_string(),
-            suggested_action: "Check the account directly".to_string(),
-            confidence: Some(0.8),
-            interrupt_score: Some(0.9),
-            urgency: "security".to_string(),
-        };
-        assert!(decision.should_notify_after_failed_email_read());
-        decision.urgency = "routine".to_string();
-        assert!(!decision.should_notify_after_failed_email_read());
-    }
-
-    #[test]
     fn email_inspection_indexes_are_bounded_and_deduplicated() {
         let event = IntegrationEvent {
             id: "batch".to_string(),

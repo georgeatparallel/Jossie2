@@ -23,25 +23,29 @@ fn is_conversation_busy(error: &anyhow::Error) -> bool {
     error.downcast_ref::<ConversationBusy>().is_some()
 }
 
-async fn claim_conversation(state: &AppState, conv_id: Uuid) -> anyhow::Result<()> {
-    let mut active = state.active_conversations.write().await;
-    if !active.insert(conv_id) {
-        return Err(ConversationBusy {
+async fn claim_conversation(
+    state: &AppState,
+    conv_id: Uuid,
+) -> anyhow::Result<crate::conversation_runs::ConversationLease> {
+    let lease = state
+        .active_conversations
+        .claim_foreground(conv_id)
+        .await
+        .ok_or(ConversationBusy {
             conversation_id: conv_id,
-        }
-        .into());
-    }
-    drop(active);
+        })?;
     state.clear_cancel(conv_id).await;
     state.begin_run_cancellation(conv_id).await;
-    Ok(())
+    Ok(lease)
 }
 
-async fn release_conversation(state: &AppState, conv_id: Uuid) {
-    let mut active = state.active_conversations.write().await;
-    active.remove(&conv_id);
-    drop(active);
+async fn release_conversation(
+    state: &AppState,
+    conv_id: Uuid,
+    lease: crate::conversation_runs::ConversationLease,
+) {
     state.clear_cancel(conv_id).await;
+    drop(lease);
 }
 
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {

@@ -58,12 +58,7 @@ async fn execute_scheduled_task(
             let conversation_id: Uuid = task.conversation_id.parse()?;
 
             // If the conversation is currently busy (e.g. user chat), defer this run.
-            if state
-                .active_conversations
-                .read()
-                .await
-                .contains(&conversation_id)
-            {
+            if state.active_conversations.is_active(conversation_id) {
                 let retry_at = Utc::now() + chrono::Duration::seconds(30);
                 state
                     .db

@@ -263,7 +263,7 @@ async fn main() -> Result<()> {
             heartbeat_enabled: config.heartbeat.enabled,
             heartbeat_interval_secs: config.heartbeat.interval_seconds,
         },
-        active_conversations: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+        active_conversations: Arc::default(),
         cancelled_conversations: Arc::new(tokio::sync::RwLock::new(
             std::collections::HashSet::new(),
         )),

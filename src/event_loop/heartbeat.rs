@@ -36,12 +36,7 @@ async fn maybe_run_heartbeat(state: &Arc<AppState>) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    if state
-        .active_conversations
-        .read()
-        .await
-        .contains(&target.conversation_id)
-    {
+    if state.active_conversations.is_active(target.conversation_id) {
         tracing::debug!(
             "Skipping heartbeat check; conversation {} is active",
             target.conversation_id
@@ -78,9 +73,10 @@ async fn maybe_run_heartbeat(state: &Arc<AppState>) -> anyhow::Result<()> {
     let message =
         match jossie_server::agent::generate_event_message(state, target.conversation_id, &event)
             .await
+            .into_result()
         {
             Ok(msg) => msg,
-            Err(e) if e.to_string().contains("already being processed") => {
+            Err(e) if jossie_server::agent::event_error_is_deferred(&e) => {
                 tracing::debug!(
                     "Deferring heartbeat check - conversation {} is busy",
                     target.conversation_id
@@ -122,7 +118,6 @@ async fn maybe_run_heartbeat(state: &Arc<AppState>) -> anyhow::Result<()> {
             }
         };
 
-    tracing::info!("Heartbeat check result: {:?}", message);
     let Some(message) = message else {
         state
             .db
@@ -148,27 +143,31 @@ async fn maybe_run_heartbeat(state: &Arc<AppState>) -> anyhow::Result<()> {
         )
         .await?;
 
-    maybe_send_telegram_message(state, target.telegram_chat_id, &message).await?;
-
-    let assistant_msg = Message {
-        id: Uuid::new_v4(),
-        conversation_id: target.conversation_id,
-        role: Role::Assistant,
-        content: message,
-        tool_calls: None,
-        tool_call_id: None,
-        name: Some("integration_event_notification".to_string()),
-        attachments: None,
-        response_items: None,
-        created_at: Utc::now(),
-    };
-    persist_message(state, &assistant_msg).await?;
-    state.publish_event(ServerEvent::BackgroundNotification {
-        conversation_id: target.conversation_id,
-        source: "heartbeat".to_string(),
-        message: assistant_msg.content.clone(),
-    })
-    .await;
+    if let Err(error) = deliver_event_notification(state, &target, "heartbeat", message, &[]).await
+    {
+        let deferred = jossie_server::agent::event_error_is_deferred(&error);
+        state
+            .db
+            .update_work_run(
+                &work_run_id,
+                if deferred {
+                    WorkRunStatus::Cancelled
+                } else {
+                    WorkRunStatus::Failed
+                },
+                Some(if deferred {
+                    "Notification deferred"
+                } else {
+                    "Notification delivery failed"
+                }),
+                Some(&error.to_string()),
+            )
+            .await?;
+        if deferred {
+            return Ok(());
+        }
+        return Err(error);
+    }
     state
         .db
         .update_work_run(

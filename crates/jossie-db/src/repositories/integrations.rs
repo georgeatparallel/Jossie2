@@ -249,7 +249,7 @@ impl Database {
         let rows = sqlx::query_as::<_, IntegrationEventRow>(
             "SELECT id, integration, account_id, event_type, dedupe_key, payload, status, created_at, processed_at, last_error
              FROM integration_events
-             WHERE status = 'new'
+             WHERE status = 'new' AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday('now'))
              ORDER BY julianday(created_at) ASC, id ASC
              LIMIT ?"
         )
@@ -261,7 +261,7 @@ impl Database {
 
     pub async fn mark_integration_event_processed(&self, id: &str) -> anyhow::Result<()> {
         let now_str = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE integration_events SET status = 'processed', processed_at = ?, last_error = NULL WHERE id = ?")
+        sqlx::query("UPDATE integration_events SET status = 'processed', processed_at = ?, last_error = NULL, next_attempt_at = NULL, processing_started_at = NULL WHERE id = ?")
             .bind(&now_str)
             .bind(id)
             .execute(&self.pool)
@@ -271,7 +271,7 @@ impl Database {
 
     pub async fn mark_integration_event_processing(&self, id: &str) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE integration_events SET status = 'processing' WHERE id = ? AND status = 'new'",
+            "UPDATE integration_events SET status = 'processing', processing_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status = 'new' AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday('now'))",
         )
         .bind(id)
         .execute(&self.pool)
@@ -280,7 +280,7 @@ impl Database {
     }
 
     pub async fn mark_integration_event_new(&self, id: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE integration_events SET status = 'new', last_error = NULL WHERE id = ?")
+        sqlx::query("UPDATE integration_events SET status = 'new', processing_started_at = NULL, next_attempt_at = NULL WHERE id = ? AND status = 'processing' AND delivery_started_at IS NULL")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -288,7 +288,7 @@ impl Database {
     }
 
     pub async fn mark_integration_event_failed(&self, id: &str, error: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE integration_events SET status = 'failed', last_error = ? WHERE id = ?")
+        sqlx::query("UPDATE integration_events SET status = 'failed', last_error = ?, next_attempt_at = NULL WHERE id = ?")
             .bind(error)
             .bind(id)
             .execute(&self.pool)

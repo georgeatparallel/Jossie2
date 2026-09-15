@@ -51,6 +51,37 @@ pub struct MailMessageEvidence {
     pub attachments: Vec<MailAttachmentRef>,
 }
 
+/// Read-only evidence access, shared by proactive evaluation and its test providers.
+#[async_trait::async_trait]
+pub trait MailEvidenceReader: Send + Sync {
+    async fn read_message_evidence(
+        &self,
+        message_ref: MessageRef,
+    ) -> anyhow::Result<MailMessageEvidence>;
+    async fn download_attachment(
+        &self,
+        message_ref: &MessageRef,
+        attachment: &MailAttachmentRef,
+    ) -> anyhow::Result<Vec<u8>>;
+}
+
+#[async_trait::async_trait]
+impl MailEvidenceReader for MailIntegration {
+    async fn read_message_evidence(
+        &self,
+        message_ref: MessageRef,
+    ) -> anyhow::Result<MailMessageEvidence> {
+        MailIntegration::read_message_evidence(self, message_ref).await
+    }
+    async fn download_attachment(
+        &self,
+        message_ref: &MessageRef,
+        attachment: &MailAttachmentRef,
+    ) -> anyhow::Result<Vec<u8>> {
+        MailIntegration::download_attachment(self, message_ref, attachment).await
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MailSearchArgs {

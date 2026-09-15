@@ -2,24 +2,46 @@ pub async fn generate_event_message(
     state: &AppState,
     conversation_id: Uuid,
     event: &IntegrationEvent,
-) -> anyhow::Result<Option<String>> {
-    claim_conversation(state, conversation_id).await?;
-
-    let result = AssertUnwindSafe(generate_event_message_inner(state, conversation_id, event))
-        .catch_unwind()
-        .await;
-
-    release_conversation(state, conversation_id).await;
-
-    match result {
-        Ok(result) => result,
-        Err(payload) => {
-            let panic_message = panic_payload_to_string(payload);
-            tracing::error!(
-                "Event-mode agent loop panicked for conversation {conversation_id}: {panic_message}"
-            );
-            anyhow::bail!("Event-mode agent loop panicked: {panic_message}")
+) -> EventEvaluation {
+    let Some(lease) = state.active_conversations.claim_background(conversation_id) else {
+        return EventEvaluation::Deferred("Conversation has foreground work".to_string());
+    };
+    let result = tokio::select! {
+        biased;
+        _ = lease.cancellation.cancelled() => {
+            return EventEvaluation::Deferred("Background evaluation interrupted by foreground work".to_string());
         }
+        result = AssertUnwindSafe(generate_event_message_inner(state, conversation_id, event)).catch_unwind() => result,
+    };
+    match result {
+        Ok(Ok(Some((message, evaluated_at)))) => EventEvaluation::Notify(EventNotification {
+            message,
+            evaluated_at,
+            fingerprint: event_notification_fingerprint(event),
+            lease,
+        }),
+        Ok(Ok(None)) => EventEvaluation::Skip,
+        Ok(Err(error))
+            if matches!(
+                error.downcast_ref::<EventEvaluationError>(),
+                Some(EventEvaluationError::Inspection(_))
+            ) =>
+        {
+            let Some(EventEvaluationError::Inspection(errors)) =
+                error.downcast_ref::<EventEvaluationError>()
+            else {
+                unreachable!()
+            };
+            EventEvaluation::InspectionFailed(errors.clone())
+        }
+        Ok(Err(error)) if event_error_is_permanent(&error) => {
+            EventEvaluation::Failed(format!("{error:#}"))
+        }
+        Ok(Err(error)) => EventEvaluation::Retry(format!("{error:#}")),
+        Err(payload) => EventEvaluation::Failed(format!(
+            "Event evaluation panicked: {}",
+            panic_payload_to_string(payload)
+        )),
     }
 }
 
@@ -54,6 +76,7 @@ struct EmailTriageResponse {
 struct InspectedEmailEvidence {
     successful_evidence_reads: usize,
     failed_reads: usize,
+    errors: Vec<EmailInspectionFailure>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,18 +138,19 @@ const EVENT_EMAIL_READ_RETRIES: usize = 2;
 const EVENT_NOTIFICATION_HISTORY_LIMIT: usize = 3;
 const EVENT_NOTIFY_CONFIDENCE_THRESHOLD: f32 = 0.55;
 const EVENT_NOTIFY_INTERRUPT_THRESHOLD: f32 = 0.65;
-const EVENT_FAILED_READ_CONFIDENCE_THRESHOLD: f32 = 0.75;
-const EVENT_FAILED_READ_INTERRUPT_THRESHOLD: f32 = 0.85;
 const HEARTBEAT_EVENT_TYPE: &str = HEARTBEAT_CHECK;
 
 async fn generate_event_message_inner(
     state: &AppState,
     conversation_id: Uuid,
     event: &IntegrationEvent,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<(String, chrono::DateTime<chrono::Utc>)>> {
     let mut messages = state
         .db
-        .get_messages(conversation_id, Some(state.agent.event_max_context_messages))
+        .get_messages(
+            conversation_id,
+            Some(state.agent.event_max_context_messages),
+        )
         .await?;
     let recent_notification_context = build_recent_notification_context(&messages);
     messages.retain(|m| !is_event_notification_message(m));
@@ -186,13 +210,17 @@ async fn generate_event_message_inner(
 
     let inspected_email_evidence = if is_email_event(event) {
         let triage = run_email_summary_triage(state, &messages, &prompt_cache_key).await?;
-        if !triage.action.trim().eq_ignore_ascii_case("inspect") {
+        if triage.action.trim().eq_ignore_ascii_case("skip") {
             return Ok(None);
         }
+        anyhow::ensure!(
+            triage.action.trim().eq_ignore_ascii_case("inspect"),
+            "Invalid email triage action"
+        );
         let indexes = normalize_email_indexes(event, triage.email_indexes);
         if indexes.is_empty() {
             tracing::warn!(event_id = %event.id, "Email triage requested inspection without valid indexes");
-            return Ok(None);
+            anyhow::bail!("Email triage requested inspection without valid indexes");
         }
         Some(inspect_email_evidence(state, event, &indexes, &mut messages).await)
     } else {
@@ -206,6 +234,20 @@ async fn generate_event_message_inner(
             "Prepared inspected email evidence for final notification decision"
         );
     }
+    if let Some(evidence) = &inspected_email_evidence {
+        if evidence.failed_reads > 0 || evidence.successful_evidence_reads == 0 {
+            return Err(EventEvaluationError::Inspection(evidence.errors.clone()).into());
+        }
+    }
+    if inspected_email_evidence.is_some() {
+        // The final decision sees inspected evidence, not previews of other mail
+        // in the same batch that triage did not select for verification.
+        messages.retain(|message| {
+            !message
+                .content
+                .starts_with("New integration event to evaluate:\n")
+        });
+    }
     messages.push(Message::transient(
         Role::User,
         "Make the final interruption decision now. Return strict JSON only in this exact shape: {\"action\":\"notify|skip\",\"message\":\"<short user-facing message or empty when skipping>\",\"what_happened\":\"...\",\"why_now\":\"...\",\"what_changed\":\"...\",\"suggested_action\":\"...\",\"confidence\":0.0,\"interrupt_score\":0.0,\"urgency\":\"routine|time_sensitive|security\"}."
@@ -215,22 +257,17 @@ async fn generate_event_message_inner(
     let tools = build_event_mode_tools(state, event);
     let event_output_format = event_mode_output_format();
     let fingerprint = event_notification_fingerprint(event);
-    let mut previous_response_id: Option<String> = None;
-    let mut chained_messages = Vec::new();
 
     for _ in 0..EVENT_MODE_MAX_ITERATIONS {
-        let output = complete_agent_iteration(
+        let evaluated_at = chrono::Utc::now();
+        let output = complete_event_iteration(
             state,
             &messages,
-            &chained_messages,
             &tools,
-            previous_response_id.as_deref(),
             &prompt_cache_key,
-            Some(&event_output_format),
+            &event_output_format,
         )
         .await?;
-        previous_response_id = output.response_id.clone();
-        chained_messages.clear();
         let content = output.content;
         let tool_calls = output.tool_calls;
         let response_items = output.response_items;
@@ -246,12 +283,7 @@ async fn generate_event_message_inner(
                     if message.is_empty() {
                         return Ok(None);
                     }
-                    if !decision.should_notify()
-                        || inspected_email_evidence.as_ref().is_some_and(|evidence| {
-                            evidence.successful_evidence_reads == 0
-                                && !decision.should_notify_after_failed_email_read()
-                        })
-                    {
+                    if !decision.should_notify() {
                         tracing::debug!(
                             "Skipping event notification for conversation {} because confidence/interrupt score was too low: confidence={:?} interrupt_score={:?}",
                             conversation_id,
@@ -269,8 +301,7 @@ async fn generate_event_message_inner(
                         );
                         return Ok(None);
                     }
-                    record_event_notification(state, conversation_id, &fingerprint).await?;
-                    return Ok(Some(message.to_string()));
+                    return Ok(Some((message.to_string(), evaluated_at)));
                 }
             }
 
@@ -288,7 +319,7 @@ async fn generate_event_message_inner(
                 "Dropping invalid event-mode output instead of forwarding raw content: {:.400}",
                 trimmed
             );
-            return Ok(None);
+            anyhow::bail!("Invalid event-mode output");
         }
 
         let assistant_msg = Message::transient(Role::Assistant, content.clone())
@@ -307,14 +338,13 @@ async fn generate_event_message_inner(
                     .with_name(call.name.clone()),
             };
             messages.push(tool_msg.clone());
-            chained_messages.push(tool_msg);
         }
     }
 
     tracing::warn!(
         "Event mode exceeded max iterations ({EVENT_MODE_MAX_ITERATIONS}) for conversation {conversation_id}"
     );
-    Ok(None)
+    anyhow::bail!("Event evaluation exceeded its iteration limit")
 }
 
 async fn run_email_summary_triage(
@@ -329,14 +359,12 @@ async fn run_email_summary_triage(
             "Summary triage only. Return `skip` for routine mail. Return `inspect` with the 1-based indexes of only the messages that may justify interrupting the user after their bodies are checked. Select at most {MAX_EVENT_EMAIL_INSPECTIONS}; do not write a user-facing notification yet. Return strict JSON only in this exact shape: {{\"action\":\"skip|inspect\",\"email_indexes\":[1]}}. Use an empty array when skipping."
         ),
     ));
-    let output = complete_agent_iteration(
+    let output = complete_event_iteration(
         state,
         &triage_messages,
         &[],
-        &[],
-        None,
         prompt_cache_key,
-        Some(&email_triage_output_format()),
+        &email_triage_output_format(),
     )
     .await?;
     parse_email_triage_response(&output.content).ok_or_else(|| {
@@ -390,7 +418,7 @@ fn normalize_email_indexes(event: &IntegrationEvent, indexes: Vec<usize>) -> Vec
     normalized
 }
 
-fn email_event_at_index(
+pub fn email_event_at_index(
     event: &IntegrationEvent,
     index: usize,
 ) -> anyhow::Result<IntegrationEvent> {
@@ -476,6 +504,7 @@ async fn read_email_evidence_with_retry(
         .await
         {
             Ok(Ok(evidence)) => return Ok(evidence),
+            Ok(Err(error)) if event_error_is_permanent(&error) => return Err(error),
             Ok(Err(error)) => last_error = Some(error),
             Err(_) => {
                 last_error = Some(anyhow::anyhow!(
@@ -504,13 +533,23 @@ async fn inspect_email_evidence(
     let mut remaining_attachment_bytes = state.agent.max_attachment_bytes_per_request;
     let mut successful_evidence_reads = 0;
     let mut failed_reads = 0;
+    let mut errors = Vec::new();
 
     for index in indexes {
         let source_event = match email_event_at_index(event, *index) {
             Ok(event) => event,
             Err(error) => {
                 failed_reads += 1;
-                text.push_str(&format!("\n## Email {index}\nRead failed: {error}\n"));
+                let detail = format!(
+                    "batch {} email {index}: invalid event reference: {error}",
+                    event.id
+                );
+                tracing::warn!(event_id = %event.id, email_index = index, error = %error, "Email reference failed");
+                errors.push(EmailInspectionFailure {
+                    event_id: None,
+                    detail,
+                    permanent: true,
+                });
                 continue;
             }
         };
@@ -518,7 +557,16 @@ async fn inspect_email_evidence(
             Ok(message_ref) => message_ref,
             Err(error) => {
                 failed_reads += 1;
-                text.push_str(&format!("\n## Email {index}\nRead failed: {error}\n"));
+                let detail = format!(
+                    "batch {} email {index}: invalid event reference: {error}",
+                    event.id
+                );
+                tracing::warn!(event_id = %event.id, email_index = index, error = %error, "Email reference failed");
+                errors.push(EmailInspectionFailure {
+                    event_id: Some(source_event.id.clone()),
+                    detail,
+                    permanent: true,
+                });
                 continue;
             }
         };
@@ -526,7 +574,16 @@ async fn inspect_email_evidence(
             Ok(evidence) => evidence,
             Err(error) => {
                 failed_reads += 1;
-                text.push_str(&format!("\n## Email {index}\nRead failed: {error}\n"));
+                let detail = format!(
+                    "event {} provider {} body read: {error:#}",
+                    source_event.id, source_event.integration
+                );
+                tracing::warn!(event_id = %source_event.id, provider = %source_event.integration, error = %error, "Email body read failed");
+                errors.push(EmailInspectionFailure {
+                    event_id: Some(source_event.id.clone()),
+                    detail,
+                    permanent: event_error_is_permanent(&error),
+                });
                 continue;
             }
         };
@@ -543,6 +600,8 @@ async fn inspect_email_evidence(
             evidence.body
         ));
 
+        let mut attachment_problems = Vec::new();
+        let mut permanent_attachment_failure = false;
         for attachment in &evidence.attachments {
             text.push_str(&format!(
                 "Attachment: {} ({}, {} bytes)",
@@ -556,10 +615,18 @@ async fn inspect_email_evidence(
                 data: None,
             };
             if !model_supports_attachment(&candidate) {
+                attachment_problems.push(format!(
+                    "attachment {} has unsupported type {}",
+                    attachment.attachment_id, attachment.mime_type
+                ));
                 text.push_str(" [metadata only: unsupported type]\n");
                 continue;
             }
             if attachment.size > remaining_attachment_bytes {
+                attachment_problems.push(format!(
+                    "attachment {} exceeds request budget",
+                    attachment.attachment_id
+                ));
                 text.push_str(" [metadata only: attachment budget exceeded]\n");
                 continue;
             }
@@ -571,7 +638,7 @@ async fn inspect_email_evidence(
             )
             .await
             {
-                Ok(Ok(data)) if data.len() <= remaining_attachment_bytes => {
+                Ok(Ok(data)) if !data.is_empty() && data.len() <= remaining_attachment_bytes => {
                     remaining_attachment_bytes -= data.len();
                     let mut hydrated = candidate;
                     hydrated.size = i64::try_from(data.len()).unwrap_or(i64::MAX);
@@ -580,15 +647,44 @@ async fn inspect_email_evidence(
                     request_attachments.push(hydrated);
                     has_verified_evidence = true;
                 }
-                Ok(Ok(_)) => text.push_str(" [metadata only: attachment budget exceeded]\n"),
-                Ok(Err(error)) => text.push_str(&format!(" [read failed: {error}]\n")),
-                Err(_) => text.push_str(" [read failed: timed out]\n"),
+                Ok(Ok(_)) => attachment_problems.push(format!(
+                    "attachment {} is empty or exceeds request budget",
+                    attachment.attachment_id
+                )),
+                Ok(Err(error)) => {
+                    permanent_attachment_failure |= event_error_is_permanent(&error);
+                    attachment_problems.push(format!(
+                        "attachment {} read failed: {error:#}",
+                        attachment.attachment_id
+                    ));
+                }
+                Err(_) => attachment_problems.push(format!(
+                    "attachment {} read timed out",
+                    attachment.attachment_id
+                )),
             }
+        }
+        for problem in &attachment_problems {
+            tracing::warn!(event_id = %source_event.id, provider = %source_event.integration, error = %problem, "Email attachment inspection failed");
+            text.push_str(&format!("\nAttachment evidence unavailable: {problem}\n"));
         }
         if has_verified_evidence {
             successful_evidence_reads += 1;
         } else {
             failed_reads += 1;
+            let detail = format!(
+                "event {} provider {}: no verified body or attachment (body source: {}); {}",
+                source_event.id,
+                source_event.integration,
+                evidence.body_source,
+                attachment_problems.join("; ")
+            );
+            tracing::warn!(event_id = %source_event.id, provider = %source_event.integration, error = %detail, "Email inspection incomplete");
+            errors.push(EmailInspectionFailure {
+                event_id: Some(source_event.id.clone()),
+                detail,
+                permanent: permanent_attachment_failure,
+            });
         }
     }
 
@@ -600,6 +696,7 @@ async fn inspect_email_evidence(
     InspectedEmailEvidence {
         successful_evidence_reads,
         failed_reads,
+        errors,
     }
 }
 
@@ -647,10 +744,9 @@ fn build_event_mode_tools(
             CapabilityGroup::Calendar,
             CapabilityGroup::Scheduler,
         ],
-        jossie_core::events::HOME_STATE_CHANGED => &[
-            CapabilityGroup::Home,
-            CapabilityGroup::Scheduler,
-        ],
+        jossie_core::events::HOME_STATE_CHANGED => {
+            &[CapabilityGroup::Home, CapabilityGroup::Scheduler]
+        }
         _ => &[],
     };
     let mut tools: Vec<jossie_core::ToolDefinition> = state
@@ -700,16 +796,12 @@ impl EventModeResponse {
     }
 
     fn should_notify(&self) -> bool {
-        self.has_minimal_brief()
+        matches!(
+            self.urgency.as_str(),
+            "routine" | "time_sensitive" | "security"
+        ) && self.has_minimal_brief()
             && self.confidence_value() >= EVENT_NOTIFY_CONFIDENCE_THRESHOLD
             && self.interrupt_score_value() >= EVENT_NOTIFY_INTERRUPT_THRESHOLD
-    }
-
-    fn should_notify_after_failed_email_read(&self) -> bool {
-        matches!(self.urgency.trim(), "time_sensitive" | "security")
-            && self.has_minimal_brief()
-            && self.confidence_value() >= EVENT_FAILED_READ_CONFIDENCE_THRESHOLD
-            && self.interrupt_score_value() >= EVENT_FAILED_READ_INTERRUPT_THRESHOLD
     }
 }
 
@@ -1055,7 +1147,7 @@ async fn should_suppress_event_notification(
     Ok(elapsed < chrono::Duration::seconds(EVENT_NOTIFY_COOLDOWN_SECONDS))
 }
 
-async fn record_event_notification(
+pub async fn record_event_notification(
     state: &AppState,
     conversation_id: Uuid,
     fingerprint: &str,

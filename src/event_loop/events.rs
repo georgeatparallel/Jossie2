@@ -7,6 +7,7 @@ async fn process_pending_events(state: &Arc<AppState>) -> anyhow::Result<()> {
         .db
         .list_pending_integration_events(PENDING_LIMIT)
         .await?;
+    let mut errors = Vec::new();
     let mut email_events = Vec::new();
     let mut calendar_events = Vec::new();
     for event in events {
@@ -22,10 +23,6 @@ async fn process_pending_events(state: &Arc<AppState>) -> anyhow::Result<()> {
         tracing::info!("Processing event: {}", event.id);
         if let Err(e) = handle_event(state, &target, &event).await {
             tracing::error!("Event processing failed for {}: {}", event.id, e);
-            state
-                .db
-                .mark_integration_event_failed(&event.id, &e.to_string())
-                .await?;
         }
     }
 
@@ -33,15 +30,23 @@ async fn process_pending_events(state: &Arc<AppState>) -> anyhow::Result<()> {
         tracing::info!("Batch processing {} email events", email_events.len());
         if let Err(e) = handle_email_event_batch(state, &target, &email_events).await {
             tracing::error!("Email batch processing failed: {}", e);
+            errors.push(e.to_string());
         }
     }
     if !calendar_events.is_empty() {
         tracing::info!("Batch processing {} calendar events", calendar_events.len());
         if let Err(e) = handle_calendar_event_batch(state, &target, &calendar_events).await {
             tracing::error!("Calendar batch processing failed: {}", e);
+            errors.push(e.to_string());
         }
     }
 
+    if let Some(problem) = state.db.integration_event_retry_problem().await? {
+        errors.push(problem);
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("Event queue needs attention: {}", errors.join("; "));
+    }
     Ok(())
 }
 
@@ -69,22 +74,6 @@ async fn resolve_background_target(
         conversation_id,
         telegram_chat_id,
     }))
-}
-
-async fn maybe_send_telegram_message(
-    state: &Arc<AppState>,
-    telegram_chat_id: Option<i64>,
-    message: &str,
-) -> anyhow::Result<()> {
-    if state.telegram.token.trim().is_empty() {
-        return Ok(());
-    }
-
-    let Some(chat_id) = telegram_chat_id else {
-        return Ok(());
-    };
-
-    jossie_telegram::send_message(&state.telegram.token, chat_id, message).await
 }
 
 fn is_email_event(event: &IntegrationEvent) -> bool {
@@ -138,7 +127,7 @@ async fn handle_event(
         )
         .await?;
 
-    // If we fail anywhere below, reset the event status to 'new' so it can be retried
+    // Persist evaluation failure and retry state below.
     let result = process_event_inner(state, target, event).await;
 
     match result {
@@ -171,11 +160,7 @@ async fn handle_event(
             Ok(())
         }
         Err(e) => {
-            // Reset event to 'new' status on failure so it can be retried
-            state
-                .db
-                .mark_integration_event_failed(&event.id, &e.to_string())
-                .await?;
+            finish_event_failure(&state.db, std::slice::from_ref(event), &e).await?;
             state
                 .db
                 .annotate_work_run(
@@ -222,9 +207,10 @@ async fn process_event_inner(
     let message =
         match jossie_server::agent::generate_event_message(state, target.conversation_id, event)
             .await
+            .into_result()
         {
             Ok(msg) => msg,
-            Err(e) if e.to_string().contains("already being processed") => {
+            Err(e) if jossie_server::agent::event_error_is_deferred(&e) => {
                 // Conversation is busy with Telegram chat or another event, retry later.
                 tracing::debug!(
                     "Deferring event {} - conversation {} is busy",
@@ -237,40 +223,20 @@ async fn process_event_inner(
             Err(e) => return Err(e),
         };
 
-    tracing::info!("Generated message: {:?}", message);
     let Some(message) = message else {
         state.db.mark_integration_event_processed(&event.id).await?;
         return Ok(false);
     };
 
-    if target.telegram_chat_id.is_some() && !state.telegram.token.trim().is_empty() {
-        tracing::info!("Sending message: {}", message);
-    }
-    maybe_send_telegram_message(state, target.telegram_chat_id, &message).await?;
-    if target.telegram_chat_id.is_some() && !state.telegram.token.trim().is_empty() {
-        tracing::info!("Message sent: {}", message);
-    }
+    deliver_event_notification(
+        state,
+        target,
+        "integration_event",
+        message,
+        std::slice::from_ref(event),
+    )
+    .await?;
 
-    let assistant_msg = Message {
-        id: Uuid::new_v4(),
-        conversation_id: target.conversation_id,
-        role: Role::Assistant,
-        content: message,
-        tool_calls: None,
-        tool_call_id: None,
-        name: Some("integration_event_notification".to_string()),
-        attachments: None,
-        response_items: None,
-        created_at: Utc::now(),
-    };
-    persist_message(state, &assistant_msg).await?;
-    state.publish_event(ServerEvent::BackgroundNotification {
-        conversation_id: target.conversation_id,
-        source: "integration_event".to_string(),
-        message: assistant_msg.content.clone(),
-    })
-    .await;
-    state.db.mark_integration_event_processed(&event.id).await?;
     Ok(true)
 }
 
@@ -327,13 +293,10 @@ async fn finish_event_batch(
     result: anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     if let Err(error) = result {
-        for event in events {
-            state
-                .db
-                .mark_integration_event_failed(&event.id, &error.to_string())
-                .await?;
+        finish_event_failure(&state.db, events, &error).await?;
+        if !jossie_server::agent::event_error_is_deferred(&error) {
+            return Err(error);
         }
-        return Err(error);
     }
     Ok(())
 }
@@ -399,9 +362,10 @@ async fn generate_and_deliver_event_batch(
         batched_event,
     )
     .await
+    .into_result()
     {
         Ok(msg) => msg,
-        Err(e) if jossie_server::agent::is_conversation_busy_error(&e) => {
+        Err(e) if jossie_server::agent::event_error_is_deferred(&e) => {
             tracing::debug!(
                 source,
                 "Deferring event batch because conversation {} is busy",
@@ -413,40 +377,12 @@ async fn generate_and_deliver_event_batch(
         Err(e) => return Err(e),
     };
 
-    tracing::info!(source, ?message, "Generated batched event message");
     let Some(message) = message else {
         mark_events_processed(state, events).await?;
         return Ok(());
     };
 
-    if target.telegram_chat_id.is_some() && !state.telegram.token.trim().is_empty() {
-        tracing::info!(source, "Sending batched event notification");
-    }
-    maybe_send_telegram_message(state, target.telegram_chat_id, &message).await?;
-    if target.telegram_chat_id.is_some() && !state.telegram.token.trim().is_empty() {
-        tracing::info!(source, "Batched event notification sent");
-    }
-
-    let assistant_msg = Message {
-        id: Uuid::new_v4(),
-        conversation_id: target.conversation_id,
-        role: Role::Assistant,
-        content: message,
-        tool_calls: None,
-        tool_call_id: None,
-        name: Some("integration_event_notification".to_string()),
-        attachments: None,
-        response_items: None,
-        created_at: Utc::now(),
-    };
-    persist_message(state, &assistant_msg).await?;
-    state.publish_event(ServerEvent::BackgroundNotification {
-        conversation_id: target.conversation_id,
-        source: source.to_string(),
-        message: assistant_msg.content.clone(),
-    })
-    .await;
-    mark_events_processed(state, events).await?;
+    deliver_event_notification(state, target, source, message, events).await?;
 
     Ok(())
 }
@@ -477,19 +413,7 @@ fn build_email_batch_event(events: &[IntegrationEvent]) -> IntegrationEvent {
         "mixed".to_string()
     };
 
-    let email_events: Vec<serde_json::Value> = sorted_events
-        .iter()
-        .map(|event| {
-            serde_json::json!({
-                "id": event.id,
-                "integration": event.integration,
-                "account_id": event.account_id,
-                "event_type": event.event_type,
-                "created_at": event.created_at,
-                "payload": event.payload,
-            })
-        })
-        .collect();
+    let email_events = &sorted_events;
 
     IntegrationEvent {
         id: Uuid::new_v4().to_string(),

@@ -25,6 +25,7 @@ include!("agent/tools.rs");
 include!("agent/run.rs");
 include!("agent/streaming.rs");
 include!("agent/reflection_knowledge.rs");
+include!("agent/event_outcome.rs");
 include!("agent/event_mode.rs");
 include!("agent/context_window.rs");
 include!("agent/tests.rs");
@@ -33,3 +34,7 @@ include!("agent/knowledge_models.rs");
 pub fn is_conversation_busy_error(error: &anyhow::Error) -> bool {
     is_conversation_busy(error)
 }
+
+#[cfg(test)]
+#[path = "agent/event_regression_tests.rs"]
+mod event_regression_tests;

@@ -17,7 +17,9 @@ impl LlmClient {
     ) -> anyhow::Result<LlmOutput> {
         let req = self.build_request(messages, tools, false, options);
 
-        let resp = self.send_responses_request(&req).await?;
+        let resp = self
+            .send_responses_request(&req, options.max_rate_limit_retries)
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -51,7 +53,10 @@ impl LlmClient {
     ) -> anyhow::Result<()> {
         let req = self.build_request(messages, tools, true, options);
 
-        let resp = match self.send_responses_request(&req).await {
+        let resp = match self
+            .send_responses_request(&req, options.max_rate_limit_retries)
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 let _ = tx

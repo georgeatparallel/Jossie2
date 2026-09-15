@@ -31,4 +31,5 @@ ts-rs = { workspace = true }
 schemars = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 jossie-integration-email = { workspace = true }

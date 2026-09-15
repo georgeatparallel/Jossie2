@@ -254,6 +254,8 @@ pub struct ResponseOutputTokenDetails {
 
 #[derive(Debug, Clone, Default)]
 pub struct LlmRequestOptions {
+    /// Override the normal rate-limit retries; background work uses zero.
+    pub max_rate_limit_retries: Option<usize>,
     pub previous_response_id: Option<String>,
     pub prompt_cache_key: Option<String>,
     pub cache_breakpoint_message_index: Option<usize>,

@@ -1,7 +1,7 @@
 use crate::events::ServerEvent;
 use jossie_core::integration::IntegrationRegistry;
 use jossie_db::Database;
-use jossie_integration_mail::MailIntegration;
+use jossie_integration_mail::MailEvidenceReader;
 use jossie_llm::LlmClient;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -76,12 +76,12 @@ pub struct AppState {
     pub kg_llm: LlmClient,
     pub chat_export_importer: Arc<jossie_integration_files::ChatExportImporter>,
     pub registry: Arc<IntegrationRegistry>,
-    pub mail_integration: Arc<MailIntegration>,
+    pub mail_integration: Arc<dyn MailEvidenceReader>,
     pub agent: AgentRuntimeConfig,
     pub web: WebRuntimeConfig,
     pub telegram: TelegramRuntimeConfig,
     pub background: BackgroundRuntimeConfig,
-    pub active_conversations: Arc<RwLock<HashSet<Uuid>>>,
+    pub active_conversations: Arc<crate::conversation_runs::ConversationRuns>,
     pub cancelled_conversations: Arc<RwLock<HashSet<Uuid>>>,
     pub run_cancellations: Arc<RwLock<HashMap<Uuid, CancellationToken>>>,
     pub pending_oauth: Arc<RwLock<HashMap<String, PendingOAuth>>>,

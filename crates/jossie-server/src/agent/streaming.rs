@@ -5,19 +5,22 @@ pub async fn run_agent_loop_streaming(
     source_message_id: Option<Uuid>,
     event_tx: tokio::sync::mpsc::Sender<ServerEvent>,
 ) {
-    if let Err(e) = claim_conversation(state, conv_id).await {
-        emit_stream_event(
-            state,
-            Some(&event_tx),
-            ServerEvent::Error {
-                conversation_id: conv_id,
-                run_id: Some(run_id),
-                error: e.to_string(),
-            },
-        )
-        .await;
-        return;
-    }
+    let lease = match claim_conversation(state, conv_id).await {
+        Ok(lease) => lease,
+        Err(e) => {
+            emit_stream_event(
+                state,
+                Some(&event_tx),
+                ServerEvent::Error {
+                    conversation_id: conv_id,
+                    run_id: Some(run_id),
+                    error: e.to_string(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
 
     let event_tx_for_error = event_tx.clone();
     let run_id_for_error = run_id.clone();
@@ -28,9 +31,9 @@ pub async fn run_agent_loop_streaming(
         source_message_id,
         event_tx,
     ))
-        .catch_unwind()
-        .await;
-    release_conversation(state, conv_id).await;
+    .catch_unwind()
+    .await;
+    release_conversation(state, conv_id, lease).await;
     let error = match result {
         Ok(Ok(())) => return,
         Ok(Err(error)) => error,

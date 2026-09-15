@@ -79,7 +79,7 @@ async fn setup_app() -> axum::Router {
             heartbeat_enabled: false,
             heartbeat_interval_secs: 14_400,
         },
-        active_conversations: Arc::new(RwLock::new(HashSet::new())),
+        active_conversations: Arc::default(),
         cancelled_conversations: Arc::new(RwLock::new(HashSet::new())),
         run_cancellations: Arc::new(RwLock::new(HashMap::new())),
         pending_oauth: Arc::new(RwLock::new(HashMap::new())),

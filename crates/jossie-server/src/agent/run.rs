@@ -4,7 +4,7 @@ pub async fn run_agent_loop_with_options(
     options: AgentRunOptions,
 ) -> anyhow::Result<String> {
     // Try to claim this conversation
-    claim_conversation(state, conv_id).await?;
+    let lease = claim_conversation(state, conv_id).await?;
 
     let run_id = Uuid::new_v4().to_string();
     if let Some(checkpoint_run_id) = options.resume_checkpoint_run_id.as_deref()
@@ -13,7 +13,7 @@ pub async fn run_agent_loop_with_options(
             .claim_work_run_checkpoint(checkpoint_run_id, &run_id)
             .await?
     {
-        release_conversation(state, conv_id).await;
+        release_conversation(state, conv_id, lease).await;
         anyhow::bail!("The continuation checkpoint is no longer available");
     }
     emit_stream_event(
@@ -47,7 +47,7 @@ pub async fn run_agent_loop_with_options(
         .await;
 
     // Release the conversation lock
-    release_conversation(state, conv_id).await;
+    release_conversation(state, conv_id, lease).await;
 
     match result {
         Ok(Ok(response)) => {
@@ -326,8 +326,13 @@ async fn process_agent_iteration_output(
             return Ok(AgentIterationOutcome::Continue);
         }
 
-        persist_final_assistant_response(state, conv_id, last_user_msg.to_string(), content.clone())
-            .await?;
+        persist_final_assistant_response(
+            state,
+            conv_id,
+            last_user_msg.to_string(),
+            content.clone(),
+        )
+        .await?;
         return Ok(AgentIterationOutcome::Final(content));
     }
 

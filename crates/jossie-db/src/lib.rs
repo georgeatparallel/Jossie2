@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+mod event_retries;
 mod work;
 pub use work::*;
 

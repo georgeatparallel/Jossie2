@@ -27,9 +27,9 @@ pub async fn create_secretary_draft(
     chat: &jossie_db::TelegramBusinessChat,
     reply_to_message_id: Option<i32>,
 ) -> anyhow::Result<jossie_db::PendingAction> {
-    claim_conversation(state, chat.conversation_id).await?;
+    let lease = claim_conversation(state, chat.conversation_id).await?;
     let result = create_secretary_draft_inner(state, chat, reply_to_message_id).await;
-    release_conversation(state, chat.conversation_id).await;
+    release_conversation(state, chat.conversation_id, lease).await;
     result
 }
 
@@ -93,9 +93,15 @@ async fn create_secretary_draft_inner(
 
     let mut messages = state
         .db
-        .get_messages(current.conversation_id, Some(state.agent.max_context_messages))
+        .get_messages(
+            current.conversation_id,
+            Some(state.agent.max_context_messages),
+        )
         .await?;
-    anyhow::ensure!(!messages.is_empty(), "Managed Telegram chat has no messages");
+    anyhow::ensure!(
+        !messages.is_empty(),
+        "Managed Telegram chat has no messages"
+    );
     let latest_text = messages
         .iter()
         .rev()
@@ -169,8 +175,8 @@ async fn create_secretary_draft_inner(
                         owner_note: String::new(),
                         context_categories: Vec::new(),
                     })
-                },
-            )?);
+                })?,
+            );
             break;
         }
 

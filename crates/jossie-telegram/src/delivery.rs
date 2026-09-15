@@ -80,6 +80,62 @@ pub async fn send_message(token: &str, chat_id: i64, text: &str) -> anyhow::Resu
     Ok(())
 }
 
+#[derive(Debug)]
+pub enum NotificationDeliveryError {
+    Retryable(String),
+    Permanent(String),
+    Uncertain(String),
+}
+
+impl std::fmt::Display for NotificationDeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(message) | Self::Permanent(message) | Self::Uncertain(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+impl std::error::Error for NotificationDeliveryError {}
+
+/// One request, no hidden sleeps or chunk retries. A transport failure may have
+/// happened after Telegram accepted the message, so it must not be replayed.
+pub async fn send_notification(
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> Result<(), NotificationDeliveryError> {
+    if token.trim().is_empty()
+        || text.trim().is_empty()
+        || text.encode_utf16().count() > TELEGRAM_MESSAGE_LIMIT
+    {
+        return Err(NotificationDeliveryError::Permanent(
+            "Invalid Telegram notification or missing token".to_string(),
+        ));
+    }
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        Bot::new(token.trim()).send_message(ChatId(chat_id), text),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(teloxide::RequestError::RetryAfter(seconds))) => {
+            Err(NotificationDeliveryError::Retryable(format!(
+                "Telegram rate limited notification; retry after {} seconds",
+                seconds.duration().as_secs()
+            )))
+        }
+        Ok(Err(teloxide::RequestError::Api(error))) => {
+            Err(NotificationDeliveryError::Permanent(error.to_string()))
+        }
+        Ok(Err(error)) => Err(NotificationDeliveryError::Uncertain(error.to_string())),
+        Err(_) => Err(NotificationDeliveryError::Uncertain(
+            "Telegram notification timed out".to_string(),
+        )),
+    }
+}
+
 async fn send_generic_error(
     bot: &Bot,
     msg: &teloxide::types::Message,

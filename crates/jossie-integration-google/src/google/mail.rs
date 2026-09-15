@@ -113,8 +113,9 @@ impl GoogleIntegration {
             .await?;
 
         if !resp.status().is_success() {
+            let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Gmail read failed: {body}");
+            anyhow::bail!("Gmail read failed ({status}): {body}");
         }
 
         let msg: serde_json::Value = resp.json().await?;

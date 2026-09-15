@@ -9,8 +9,10 @@ impl LlmClient {
     async fn send_responses_request(
         &self,
         request: &ResponsesRequest,
+        max_retries: Option<usize>,
     ) -> anyhow::Result<reqwest::Response> {
-        for retry_count in 0..=MAX_RATE_LIMIT_RETRIES {
+        let max_retries = max_retries.unwrap_or(MAX_RATE_LIMIT_RETRIES);
+        for retry_count in 0..=max_retries {
             let response = self
                 .client
                 .post(format!("{}/responses", self.api_url))
@@ -20,7 +22,7 @@ impl LlmClient {
                 .await?;
 
             if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
-                || retry_count == MAX_RATE_LIMIT_RETRIES
+                || retry_count == max_retries
             {
                 return Ok(response);
             }
@@ -35,7 +37,7 @@ impl LlmClient {
 
             tracing::warn!(
                 retry = retry_count + 1,
-                max_retries = MAX_RATE_LIMIT_RETRIES,
+                max_retries,
                 delay_ms = delay.as_millis() as u64,
                 request_id,
                 response_body = %truncate_retry_body(&response_body),
@@ -57,9 +59,7 @@ fn rate_limit_retry_delay(
         .min(std::time::Duration::from_secs(MAX_RETRY_DELAY_SECS))
 }
 
-fn retry_after_delay(
-    headers: &reqwest::header::HeaderMap,
-) -> Option<std::time::Duration> {
+fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
 
     if let Ok(seconds) = value.trim().parse::<u64>() {

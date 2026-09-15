@@ -111,6 +111,82 @@
     }
 
     #[test]
+    fn real_email_batches_decode_in_the_server_inspector() {
+        let imap = mk_event(
+            "imap",
+            "new_email",
+            "email",
+            "university",
+            serde_json::json!({"uid": 42, "folder": "INBOX"}),
+        );
+        let gmail = mk_event(
+            "gmail",
+            "gmail_new_message",
+            "google",
+            "personal",
+            serde_json::json!({"message_id": "abc"}),
+        );
+        for events in [vec![imap.clone()], vec![gmail.clone()], vec![imap, gmail]] {
+            let batch = build_email_batch_event(&events);
+            for index in 1..=events.len() {
+                let decoded = jossie_server::agent::email_event_at_index(&batch, index).unwrap();
+                let original = events.iter().find(|event| event.id == decoded.id).unwrap();
+                assert_eq!(
+                    serde_json::to_value(decoded).unwrap(),
+                    serde_json::to_value(original).unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_does_not_discard_other_emails_in_the_batch() {
+        let db = jossie_db::Database::new("sqlite::memory:").await.unwrap();
+        db.migrate().await.unwrap();
+        for id in ["bad", "good"] {
+            db.insert_integration_event(
+                "google",
+                "account",
+                GMAIL_NEW_MESSAGE,
+                id,
+                &serde_json::json!({"message_id": id}),
+            )
+            .await
+            .unwrap();
+        }
+        let events = db.list_pending_integration_events(10).await.unwrap();
+        for event in &events {
+            db.mark_integration_event_processing(&event.id)
+                .await
+                .unwrap();
+        }
+        let bad = events
+            .iter()
+            .find(|event| event.dedupe_key == "bad")
+            .unwrap();
+        let error = jossie_server::agent::EventEvaluationError::Inspection(vec![
+            jossie_server::agent::EmailInspectionFailure {
+                event_id: Some(bad.id.clone()),
+                detail: "Gmail read failed (404 Not Found)".to_string(),
+                permanent: true,
+            },
+        ])
+        .into();
+        finish_event_failure(&db, &events, &error).await.unwrap();
+        let pending = db.list_pending_integration_events(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].dedupe_key, "good");
+        assert!(
+            db.integration_event_retry_problem()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("404")
+        );
+        assert_eq!(db.list_activity_events(10, None).await.unwrap().len(), 1);
+    }
+
+    #[test]
     fn reduces_calendar_events_with_dedupe_and_filtering() {
         let old = mk_event(
             "old",

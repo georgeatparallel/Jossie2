@@ -90,6 +90,24 @@ mod tests {
         LlmClient::new("https://example.invalid/v1", "test", "test-model")
     }
 
+    #[tokio::test]
+    async fn background_retry_override_returns_first_rate_limit() {
+        let (address, attempts) = spawn_rate_limited_responses_server(usize::MAX).await;
+        let client = LlmClient::new(&format!("http://{address}/v1"), "test", "test-model");
+        let result = client
+            .complete_with_options(
+                &[make_message(Role::User, "Check event")],
+                &[],
+                &LlmRequestOptions {
+                    max_rate_limit_retries: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.unwrap_err().to_string().contains("429"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
     fn make_message(role: Role, content: &str) -> Message {
         Message {
             id: Uuid::new_v4(),

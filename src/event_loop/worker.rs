@@ -286,19 +286,15 @@ async fn update_worker(
 }
 
 async fn recover_stale_processing_events(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let before =
-        (Utc::now() - chrono::Duration::seconds(STALE_PROCESSING_EVENT_TIMEOUT_SECS)).to_rfc3339();
     let recovered = state
         .db
-        .mark_stale_processing_integration_events_failed(
-            &before,
-            "Marked failed at startup because the event was left in processing by a previous worker",
-        )
+        .recover_interrupted_event_evaluations(&Utc::now().to_rfc3339())
         .await?;
-
     if recovered > 0 {
-        tracing::warn!("Marked {recovered} stale processing integration event(s) as failed");
+        tracing::warn!(
+            recovered,
+            "Recovered interrupted event evaluations; uncertain deliveries require review"
+        );
     }
-
     Ok(())
 }

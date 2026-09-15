@@ -78,7 +78,7 @@ pub async fn update_conversation(
             "Conversation titles must contain 1 to 120 characters"
         )));
     }
-    if request.archived == Some(true) && state.active_conversations.read().await.contains(&id) {
+    if request.archived == Some(true) && state.active_conversations.is_active(id) {
         return Err(AppError::conflict(anyhow::anyhow!(
             "Stop the current run before archiving this conversation"
         )));
@@ -305,7 +305,7 @@ pub async fn delete_conversation(
             "Archive the conversation before permanently deleting it"
         )));
     }
-    if state.active_conversations.read().await.contains(&id)
+    if state.active_conversations.is_active(id)
         || state.db.conversation_has_active_dependencies(id).await?
     {
         return Err(AppError::conflict(anyhow::anyhow!(
