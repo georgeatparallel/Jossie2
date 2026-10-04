@@ -81,7 +81,8 @@ impl Database {
         let rows = sqlx::query_as::<_, ConversationListRow>(
             "SELECT c.id, c.title, c.kind, c.archived_at, c.created_at, c.updated_at,
                     COALESCE(
-                      (SELECT substr(m.content, 1, 240) FROM messages m
+                      (SELECT CASE WHEN c.kind = 'telegram_secretary' THEN m.content
+                                   ELSE substr(m.content, 1, 240) END FROM messages m
                        WHERE m.conversation_id = c.id
                          AND m.role IN ('user', 'assistant') AND trim(m.content) != ''
                          AND (? = '' OR lower(m.content) LIKE lower(?) ESCAPE '\\')
@@ -140,7 +141,11 @@ impl Database {
                     .transpose()?;
                 row.preview = row
                     .preview
-                    .map(|value| self.unprotect_sensitive_data(&value))
+                    .map(|value| {
+                        // Ciphertext must remain intact until after authentication/decryption.
+                        self.unprotect_sensitive_data(&value)
+                            .map(|plaintext| plaintext.chars().take(240).collect())
+                    })
                     .transpose()?;
             }
             items.push(ConversationListItem::try_from(row)?);
