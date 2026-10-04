@@ -80,7 +80,7 @@ impl Database {
              ORDER BY next_run_at IS NULL, next_run_at ASC
              LIMIT ?",
         )
-        .bind(limit.clamp(1, 20) as i64)
+        .bind(limit.clamp(1, 100) as i64)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -111,7 +111,7 @@ impl Database {
             sqlx::query(
                 "UPDATE scheduled_tasks
                  SET status = 'pending', next_run_at = ?, last_run_at = ?, run_count = run_count + 1, updated_at = ?
-                 WHERE id = ?"
+                 WHERE id = ? AND status = 'running'"
             )
             .bind(next_run)
             .bind(&now_str)
@@ -121,7 +121,7 @@ impl Database {
             .await?;
         } else {
             sqlx::query(
-                "UPDATE scheduled_tasks SET status = 'pending', next_run_at = ?, updated_at = ? WHERE id = ?",
+                "UPDATE scheduled_tasks SET status = 'pending', next_run_at = ?, updated_at = ? WHERE id = ? AND status = 'running'",
             )
                 .bind(next_run)
                 .bind(&now_str)
@@ -135,7 +135,7 @@ impl Database {
     pub async fn mark_task_completed(&self, id: &str) -> anyhow::Result<()> {
         let now_str = Utc::now().to_rfc3339();
         sqlx::query(
-            "UPDATE scheduled_tasks SET status = 'completed', updated_at = ?, last_run_at = ? WHERE id = ?"
+            "UPDATE scheduled_tasks SET status = 'completed', updated_at = ?, last_run_at = ? WHERE id = ? AND status = 'running'"
         )
         .bind(&now_str)
         .bind(&now_str)
@@ -148,7 +148,7 @@ impl Database {
     pub async fn mark_task_failed(&self, id: &str, error: &str) -> anyhow::Result<()> {
         let now_str = Utc::now().to_rfc3339();
         sqlx::query(
-            "UPDATE scheduled_tasks SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?"
+            "UPDATE scheduled_tasks SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ? AND status = 'running'"
         )
         .bind(error)
         .bind(&now_str)
@@ -170,13 +170,46 @@ impl Database {
     }
 
     pub async fn cancel_scheduled_task(&self, id: &str) -> anyhow::Result<()> {
-        let now_str = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE scheduled_tasks SET status = 'cancelled', updated_at = ? WHERE id = ?")
-            .bind(&now_str)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        if self.cancel_active_scheduled_task(id).await? {
+            return Ok(());
+        }
+        let task = self
+            .get_scheduled_task(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Scheduled task not found"))?;
+        if task.status != "cancelled" {
+            anyhow::bail!("This schedule is no longer active");
+        }
         Ok(())
+    }
+
+    /// Cancel future executions without interrupting an already claimed run.
+    pub async fn cancel_active_scheduled_task(&self, id: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE scheduled_tasks SET status = 'cancelled', updated_at = ?
+             WHERE id = ? AND status IN ('pending', 'running')",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn list_active_scheduled_tasks(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ScheduledTask>> {
+        let rows = sqlx::query_as::<_, ScheduledTaskRow>(
+            "SELECT id, conversation_id, task_type, task_data, schedule_type, schedule_value, status,
+             next_run_at, last_run_at, run_count, max_runs, created_at, updated_at, last_error
+             FROM scheduled_tasks WHERE status IN ('pending', 'running')
+             ORDER BY next_run_at IS NULL, next_run_at ASC, id ASC LIMIT ?",
+        )
+        .bind(limit.clamp(1, 100) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     pub async fn list_scheduled_tasks_for_conversation(

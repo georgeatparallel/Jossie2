@@ -459,6 +459,23 @@ async fn process_agent_iteration_output(
         .await;
     }
 
+    let manages_schedules = prepared_calls.iter().any(|call| {
+        matches!(
+            call.name.as_str(),
+            "schedule_task" | "schedule_recurring_task" | "schedule_cron_task"
+        )
+    });
+    let mut schedules_before: HashSet<String> = if manages_schedules {
+        state
+            .db
+            .list_scheduled_tasks_for_conversation(conv_id)
+            .await?
+            .into_iter()
+            .map(|task| task.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut results = execute_tool_batch(state, conv_id, prepared_calls).await;
     results.extend(repeated_results);
     if ensure_run_not_cancelled(state, conv_id, run_id, event_tx)
@@ -469,6 +486,34 @@ async fn process_agent_iteration_output(
     }
 
     for (_, call, result) in results {
+        if !result.is_error {
+            if matches!(
+                call.name.as_str(),
+                "schedule_task" | "schedule_recurring_task" | "schedule_cron_task"
+            ) {
+                for task in state
+                    .db
+                    .list_scheduled_tasks_for_conversation(conv_id)
+                    .await?
+                {
+                    if schedules_before.insert(task.id.clone()) {
+                        emit_stream_event(
+                            state,
+                            event_tx,
+                            ServerEvent::ScheduledTaskUpdated { task },
+                        )
+                        .await;
+                    }
+                }
+            } else if call.name == "cancel_scheduled_task"
+                && let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                && let Some(id) = args.get("task_id").and_then(|id| id.as_str())
+                && let Some(task) = state.db.get_scheduled_task(id).await?
+            {
+                emit_stream_event(state, event_tx, ServerEvent::ScheduledTaskUpdated { task })
+                    .await;
+            }
+        }
         emit_stream_event(
             state,
             event_tx,
@@ -559,7 +604,8 @@ async fn run_agent_loop_inner(
     for _iteration in 0..state.agent.max_agent_iterations {
         ensure_run_not_cancelled(state, conv_id, run_id, None).await?;
         if _iteration > 0
-            && run_started.elapsed() >= Duration::from_secs(state.agent.interactive_run_budget_seconds)
+            && run_started.elapsed()
+                >= Duration::from_secs(state.agent.interactive_run_budget_seconds)
         {
             return pause_run_with_checkpoint(
                 state,

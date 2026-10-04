@@ -31,6 +31,8 @@ fn generated_contracts() -> String {
         jossie_db::ChatImport,
         jossie_db::GraphNode,
         jossie_db::GraphEdge,
+        jossie_db::GraphSearchPage,
+        jossie_db::GraphNeighborhoodPage,
         jossie_db::MemoryEntryWithMetadata,
         jossie_db::ActivityEvent,
         jossie_db::PendingAction,

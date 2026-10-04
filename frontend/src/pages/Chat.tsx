@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
+import { flushSync } from 'react-dom'
 import ReactMarkdown from 'react-markdown'
 import {
   approveAction,
@@ -11,31 +12,27 @@ import {
   downloadConversationExport,
   downloadUploadedFile,
   getMessages,
-  getWork,
   listConversations,
-  listPendingActions,
   rejectAction,
   updateSecretaryDraft,
   updateConversation,
   uploadFile,
 } from '../api'
+import { StartingActions } from '../components/StartingActions'
 import { AgentRunStatus } from '../components/AgentRunStatus'
 import type { RunStep } from '../components/AgentRunStatus'
 import { api } from '../config'
-import { useWorkspaceEvents } from '../events'
+import { useWorkspaceEvents, useWorkspaceEvent } from '../events'
 import type { Conversation, Message, PendingAction, WorkRun } from '../types'
+import { useChatDraft } from '../hooks/chatDrafts'
+import type { DraftFile } from '../hooks/chatDrafts'
+import { navigate } from '../navigation'
+import type { WorkspaceRoute } from '../navigation'
+import { useConversationState } from '../hooks/useConversationState'
+import { updateStream } from '../hooks/streamMessages'
 import { relativeDate } from '../utils/format'
 
 type ThreadView = 'active' | 'archived'
-type DraftFile = {
-  localId: string
-  id?: string
-  name: string
-  file: File
-  status: 'uploading' | 'ready' | 'error'
-  error?: string
-}
-
 const contextLabelForTool = (toolName?: string | null) => {
   const name = toolName?.toLowerCase() ?? ''
   if (name.includes('memory')) return 'Saved memories'
@@ -58,9 +55,11 @@ const contextLabelForTool = (toolName?: string | null) => {
 export function Chat({
   conversations: initialConversations,
   onRefresh,
+  route,
 }: {
   conversations: Conversation[]
   onRefresh: () => Promise<void>
+  route?: WorkspaceRoute
 }) {
   const [view, setView] = useState<ThreadView>('active')
   const [query, setQuery] = useState('')
@@ -69,24 +68,67 @@ export function Chat({
     initialConversations.length >= 50,
   )
   const [activeId, setActiveId] = useState<string | null>(
-    initialConversations[0]?.id ?? null,
+    route ? route.conversationId : (initialConversations[0]?.id ?? null),
   )
-  const [focusMessageId, setFocusMessageId] = useState<string | null>(null)
-  const [messages, setMessages] = useState<Message[]>([])
-  const [hasOlder, setHasOlder] = useState(false)
-  const [input, setInput] = useState('')
-  const [sending, setSending] = useState(false)
-  const [files, setFiles] = useState<DraftFile[]>([])
+  const [focusMessageId, setFocusMessageId] = useState<string | null>(
+    route?.messageId ?? null,
+  )
+  const composerRef = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => {
+    const focus = () => composerRef.current?.focus()
+    window.addEventListener('jossie.focus-composer', focus)
+    return () => window.removeEventListener('jossie.focus-composer', focus)
+  }, [])
+  const draftKey = activeId ?? 'new'
+  const { draft, store: draftStore } = useChatDraft(draftKey)
+  const { input, files } = draft
+  const setInput = (value: string) =>
+    draftStore.update(draftKey, (current) => ({ ...current, input: value }))
+  const setFiles = (
+    change: DraftFile[] | ((files: DraftFile[]) => DraftFile[]),
+  ) =>
+    draftStore.update(draftKey, (current) => ({
+      ...current,
+      files: typeof change === 'function' ? change(current.files) : change,
+    }))
+  useEffect(() => {
+    if (!route) return
+    setActiveId(route.conversationId)
+    setFocusMessageId(route.messageId)
+  }, [route])
   const [activity, setActivity] = useState<string | null>(null)
-  const [pendingActions, setPendingActions] = useState<PendingAction[]>([])
   const [actionError, setActionError] = useState<string | null>(null)
   const [runSteps, setRunSteps] = useState<RunStep[]>([])
-  const [activeRuns, setActiveRuns] = useState<WorkRun[]>([])
+  const { connection, resync } = useWorkspaceEvents()
   const {
-    event: workspaceEvent,
-    sequence: eventSequence,
-    connection,
-  } = useWorkspaceEvents()
+    messages,
+    setMessages,
+    hasOlder,
+    setHasOlder,
+    pendingActions,
+    setPendingActions,
+    activeRuns,
+    setActiveRuns,
+    sending,
+    setSending,
+    loadError,
+    refreshConversation,
+    clear,
+    active,
+    invalidate,
+  } = useConversationState(activeId)
+  const socketRef = useRef<WebSocket | null>(null)
+  const mounted = useRef(true)
+  const submitting = useRef(false)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
+  const threadRequest = useRef(0)
+  const searchRef = useRef({ query, view })
+  searchRef.current = { query, view }
   const [renaming, setRenaming] = useState(false)
   const [renameTitle, setRenameTitle] = useState('')
   const [confirmDelete, setConfirmDelete] = useState<Conversation | null>(null)
@@ -95,7 +137,6 @@ export function Chat({
   const threadsRef = useRef(initialConversations)
   const directSocketActive = useRef(false)
   const acceptedRef = useRef(false)
-  const retryMessageId = useRef<string | null>(null)
   const activeConversation =
     threads.find((item) => item.id === activeId) ??
     initialConversations.find((item) => item.id === activeId)
@@ -128,6 +169,7 @@ export function Chat({
 
   const loadThreads = useCallback(
     async (append = false) => {
+      const request = ++threadRequest.current
       const before = append ? threadsRef.current.at(-1)?.id : undefined
       const next = await listConversations(api, {
         view,
@@ -135,6 +177,12 @@ export function Chat({
         limit: 50,
         before,
       })
+      if (
+        request !== threadRequest.current ||
+        query !== searchRef.current.query ||
+        view !== searchRef.current.view
+      )
+        return threadsRef.current
       setThreads((current) =>
         append
           ? [
@@ -164,50 +212,35 @@ export function Chat({
     return () => clearTimeout(timer)
   }, [loadThreads])
 
-  const refreshConversation = useCallback(
-    async (conversationId: string, around?: string | null) => {
-      const [nextMessages, nextActions, nextWork] = await Promise.all([
-        getMessages(api, conversationId, 100, around ? { around } : {}),
-        listPendingActions(api, conversationId),
-        getWork(api, conversationId),
-      ])
-      setMessages(nextMessages)
-      setHasOlder(nextMessages.length === 100)
-      setPendingActions(nextActions)
-      setActiveRuns(nextWork.active_runs)
-      setSending(
-        nextWork.active_runs.some((run) =>
-          ['queued', 'running'].includes(run.status),
-        ),
-      )
-    },
-    [],
-  )
-
   const latestVisibleContent = visibleMessages.at(-1)?.content
   useEffect(() => {
-    if (activeId)
-      void refreshConversation(activeId, focusMessageId).catch((reason) =>
-        setActionError(
-          reason instanceof Error
-            ? reason.message
-            : 'Unable to load conversation.',
-        ),
-      )
-    else {
-      setMessages([])
-      setPendingActions([])
-      setActiveRuns([])
-      setHasOlder(false)
+    clear()
+    setActivity(null)
+    setRunSteps([])
+    if (activeId) void refreshConversation(activeId, focusMessageId)
+    return () => {
+      const socket = socketRef.current
+      socketRef.current = null
+      if (socket) {
+        socket.onopen = null
+        socket.onmessage = null
+        socket.onclose = null
+        socket.onerror = null
+        socket.close()
+      }
+      directSocketActive.current = false
+      threadRequest.current += 1
     }
-  }, [activeId, focusMessageId, refreshConversation])
+  }, [activeId, focusMessageId, refreshConversation, clear])
+  useEffect(() => {
+    if (resync && activeId) void refreshConversation(activeId, focusMessageId)
+  }, [resync, activeId, focusMessageId, refreshConversation])
 
   const applyRunEvent = useCallback(
     (payload: Record<string, unknown>, allowDelta: boolean) => {
       if (
         typeof payload.conversation_id === 'string' &&
-        activeId &&
-        payload.conversation_id !== activeId
+        payload.conversation_id !== active.current
       )
         return
       if (payload.type === 'run_started') {
@@ -283,26 +316,18 @@ export function Chat({
       }
       if (
         allowDelta &&
-        payload.type === 'assistant_delta' &&
-        typeof payload.content === 'string'
+        (payload.type === 'assistant_delta' ||
+          payload.type === 'assistant_reset') &&
+        typeof payload.run_id === 'string'
       ) {
-        const streamId = `stream-${String(payload.run_id ?? 'active')}`
+        invalidate()
         setMessages((current) =>
-          current.some((message) => message.id === streamId)
-            ? current.map((message) =>
-                message.id === streamId
-                  ? { ...message, content: message.content + payload.content }
-                  : message,
-              )
-            : [
-                ...current,
-                {
-                  id: streamId,
-                  role: 'assistant',
-                  content: payload.content as string,
-                  created_at: new Date().toISOString(),
-                },
-              ],
+          updateStream(
+            current,
+            payload.run_id as string,
+            typeof payload.content === 'string' ? payload.content : '',
+            payload.type === 'assistant_reset',
+          ),
         )
       }
       if (
@@ -321,27 +346,44 @@ export function Chat({
             : null,
         )
         if (activeId) void refreshConversation(activeId)
-        void loadThreads()
+        void loadThreads().catch((reason) =>
+          setActionError(
+            reason instanceof Error
+              ? reason.message
+              : 'Unable to load conversations.',
+          ),
+        )
         void onRefresh()
       }
       if (
         ['message_created', 'action_resolved', 'goal_updated'].includes(
           String(payload.type),
         ) &&
-        activeId
+        activeId &&
+        !(payload.type === 'message_created' && directSocketActive.current)
       )
         void refreshConversation(activeId)
     },
-    [activeId, loadThreads, onRefresh, refreshConversation],
+    [
+      activeId,
+      loadThreads,
+      onRefresh,
+      refreshConversation,
+      active,
+      invalidate,
+      setActiveRuns,
+      setMessages,
+      setPendingActions,
+      setSending,
+    ],
   )
 
-  useEffect(() => {
-    if (workspaceEvent)
-      applyRunEvent(
-        workspaceEvent as unknown as Record<string, unknown>,
-        !directSocketActive.current,
-      )
-  }, [eventSequence, workspaceEvent, applyRunEvent])
+  useWorkspaceEvent((event) =>
+    applyRunEvent(
+      event as unknown as Record<string, unknown>,
+      !directSocketActive.current,
+    ),
+  )
 
   useEffect(() => {
     const feed = feedRef.current
@@ -374,7 +416,18 @@ export function Chat({
       ),
     )
     try {
+      if (!draft.file)
+        throw new Error('Please remove this attachment and attach it again.')
       const uploaded = await uploadFile(api, draft.file)
+      // A removed upload must not leave an unused file behind.
+      if (
+        !draftStore
+          .get(draftKey)
+          .files.some((item) => item.localId === draft.localId)
+      ) {
+        await deleteUploadedFile(api, uploaded.file_id)
+        return
+      }
       setFiles((current) =>
         current.map((item) =>
           item.localId === draft.localId
@@ -404,6 +457,8 @@ export function Chat({
         localId: crypto.randomUUID(),
         name: file.name,
         file,
+        size: file.size,
+        mimeType: file.type,
         status: 'uploading',
       }
       setFiles((current) => [...current, draft])
@@ -421,8 +476,14 @@ export function Chat({
   const submit = async (event?: FormEvent) => {
     event?.preventDefault()
     const content = input.trim()
-    if (!content || sending || files.some((file) => file.status !== 'ready'))
+    if (
+      !content ||
+      sending ||
+      submitting.current ||
+      files.some((file) => file.status !== 'ready')
+    )
       return
+    submitting.current = true
     setActionError(null)
     setRunSteps([])
     acceptedRef.current = false
@@ -430,14 +491,30 @@ export function Chat({
     try {
       if (!conversationId) {
         const created = await createConversation(api)
+        if (!mounted.current || active.current !== activeId) return
         conversationId = created.id
-        setActiveId(created.id)
+        draftStore.move(draftKey, created.id)
+        active.current = created.id
+        flushSync(() => setActiveId(created.id))
+        if (route) navigate('chat', created.id)
         setThreads((current) => [created, ...current])
       }
-      const messageId = retryMessageId.current ?? crypto.randomUUID()
-      retryMessageId.current = messageId
+      if (active.current !== conversationId) return
+      const fileIds = files.flatMap((file) => (file.id ? [file.id] : []))
+      const pending = draftStore.get(conversationId).pending
+      const messageId =
+        pending &&
+        pending.content === content &&
+        JSON.stringify(pending.fileIds) === JSON.stringify(fileIds)
+          ? pending.id
+          : crypto.randomUUID()
+      draftStore.update(conversationId, (current) => ({
+        ...current,
+        pending: { id: messageId, content, fileIds },
+      }))
       setSending(true)
       setActivity('Sending your message…')
+      invalidate()
       setMessages((current) =>
         current.some((message) => message.id === messageId)
           ? current
@@ -453,13 +530,14 @@ export function Chat({
                   .map((file) => ({
                     id: file.id!,
                     name: file.name,
-                    size: file.file.size,
-                    mime_type: file.file.type,
+                    size: file.size,
+                    mime_type: file.mimeType,
                   })),
               },
             ],
       )
       const socket = new WebSocket(buildWebSocketUrl(api, '/api/chat/stream'))
+      socketRef.current = socket
       let terminalHandled = false
       directSocketActive.current = true
       socket.onopen = () =>
@@ -472,12 +550,17 @@ export function Chat({
           }),
         )
       socket.onmessage = (messageEvent) => {
-        const payload = JSON.parse(messageEvent.data) as Record<string, unknown>
+        if (active.current !== conversationId || socketRef.current !== socket)
+          return
+        let payload: Record<string, unknown>
+        try {
+          payload = JSON.parse(messageEvent.data) as Record<string, unknown>
+        } catch {
+          return
+        }
         if (payload.type === 'message_accepted') {
           acceptedRef.current = true
-          retryMessageId.current = null
-          setInput('')
-          setFiles([])
+          draftStore.clear(conversationId!)
           setActivity('Jossie is working…')
         } else if (payload.type === 'pending_action') {
           terminalHandled = true
@@ -492,8 +575,7 @@ export function Chat({
           terminalHandled = true
           setSending(false)
           setActivity(null)
-          setInput('')
-          retryMessageId.current = null
+          draftStore.clear(conversationId!)
         } else {
           if (payload.type === 'error' && typeof payload.error === 'string') {
             terminalHandled = true
@@ -515,6 +597,9 @@ export function Chat({
           socket.close()
       }
       socket.onclose = () => {
+        if (socketRef.current !== socket || active.current !== conversationId)
+          return
+        socketRef.current = null
         directSocketActive.current = false
         if (!acceptedRef.current && !terminalHandled) {
           setSending(false)
@@ -531,19 +616,30 @@ export function Chat({
       setActionError(
         reason instanceof Error ? reason.message : 'Unable to send message.',
       )
+    } finally {
+      submitting.current = false
     }
   }
 
   const loadOlder = async () => {
     if (!activeId || !messages.length) return
-    const older = await getMessages(api, activeId, 100, {
+    const conversationId = activeId
+    const older = await getMessages(api, conversationId, 100, {
       before: messages[0].id,
     })
-    setMessages((current) => [...older, ...current])
+    if (active.current !== conversationId) return
+    setMessages((current) => [
+      ...older.filter(
+        (item) => !current.some((existing) => existing.id === item.id),
+      ),
+      ...current,
+    ])
     setHasOlder(older.length === 100)
   }
 
   const chooseThread = (conversation: Conversation) => {
+    if (route)
+      navigate('chat', conversation.id, conversation.matched_message_id)
     setActiveId(conversation.id)
     setFocusMessageId(conversation.matched_message_id ?? null)
     setRenaming(false)
@@ -554,10 +650,12 @@ export function Chat({
     try {
       await updateConversation(api, conversation.id, { archived })
       const next = await loadThreads()
-      if (activeId === conversation.id)
-        setActiveId(
-          next.find((item) => item.id !== conversation.id)?.id ?? null,
-        )
+      if (activeId === conversation.id) {
+        const nextId =
+          next.find((item) => item.id !== conversation.id)?.id ?? null
+        setActiveId(nextId)
+        if (route) navigate('chat', nextId)
+      }
       void onRefresh()
     } catch (reason) {
       setActionError(
@@ -593,7 +691,11 @@ export function Chat({
       await deleteConversation(api, deleting.id)
       setConfirmDelete(null)
       const next = await loadThreads()
-      if (activeId === deleting.id) setActiveId(next[0]?.id ?? null)
+      draftStore.clear(deleting.id)
+      if (activeId === deleting.id) {
+        setActiveId(next[0]?.id ?? null)
+        if (route) navigate('chat', next[0]?.id)
+      }
       void onRefresh()
     } catch (reason) {
       setActionError(
@@ -643,7 +745,9 @@ export function Chat({
       )
     } catch (reason) {
       setActionError(
-        reason instanceof Error ? reason.message : 'Unable to update the draft.',
+        reason instanceof Error
+          ? reason.message
+          : 'Unable to update the draft.',
       )
       if (activeId) await refreshConversation(activeId)
       throw reason
@@ -651,7 +755,11 @@ export function Chat({
   }
 
   const composerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
+    if (
+      event.key === 'Enter' &&
+      !event.shiftKey &&
+      !event.nativeEvent.isComposing
+    ) {
       event.preventDefault()
       void submit()
     }
@@ -668,6 +776,7 @@ export function Chat({
           className="button secondary"
           onClick={() => {
             setView('active')
+            if (route) navigate('chat')
             setActiveId(null)
             setFocusMessageId(null)
             setMessages([])
@@ -837,7 +946,15 @@ export function Chat({
             {hasOlder && (
               <button
                 className="text-button load-older"
-                onClick={() => void loadOlder()}
+                onClick={() =>
+                  void loadOlder().catch((reason) =>
+                    setActionError(
+                      reason instanceof Error
+                        ? reason.message
+                        : 'Unable to load older messages.',
+                    ),
+                  )
+                }
               >
                 Load older messages
               </button>
@@ -904,6 +1021,7 @@ export function Chat({
               <div className="chat-empty">
                 <span className="brand-orb">J</span>
                 <h2>What’s on your mind?</h2>
+                <StartingActions compact />
                 <p>
                   Jossie keeps the thread, the context, and the useful details
                   together.
@@ -930,6 +1048,32 @@ export function Chat({
             onDecision={(action, approve) => void decide(action, approve)}
             onDraftUpdate={updateDraft}
           />
+          {(input || files.length > 0) && (
+            <button
+              type="button"
+              className="text-button"
+              disabled={sending}
+              onClick={() => {
+                files.forEach((file) => {
+                  if (file.id)
+                    void deleteUploadedFile(api, file.id).catch(() => undefined)
+                })
+                draftStore.clear(draftKey)
+              }}
+            >
+              Discard draft
+            </button>
+          )}
+          {loadError && (
+            <p className="chat-action-error" role="alert">
+              {loadError}{' '}
+              <button
+                onClick={() => activeId && void refreshConversation(activeId)}
+              >
+                Retry
+              </button>
+            </p>
+          )}
           {actionError && (
             <p className="chat-action-error" role="alert">
               {actionError}
@@ -942,78 +1086,83 @@ export function Chat({
               instructions.
             </div>
           ) : (
-          <form className="composer-new" onSubmit={(event) => void submit(event)}>
-            <div className="attachment-row">
-              {files.map((file) => (
-                <span
-                  key={file.localId}
-                  className={`attachment ${file.status}`}
-                >
-                  {file.name}
-                  <small>
-                    {file.status === 'uploading'
-                      ? 'Uploading…'
-                      : file.status === 'error'
-                        ? file.error
-                        : 'Ready'}
-                  </small>
-                  {file.status === 'error' && (
+            <form
+              className="composer-new"
+              onSubmit={(event) => void submit(event)}
+            >
+              <div className="attachment-row">
+                {files.map((file) => (
+                  <span
+                    key={file.localId}
+                    className={`attachment ${file.status}`}
+                  >
+                    {file.name}
+                    <small>
+                      {file.status === 'uploading'
+                        ? 'Uploading…'
+                        : file.status === 'error'
+                          ? file.error
+                          : 'Ready'}
+                    </small>
+                    {file.status === 'error' && (
+                      <button
+                        type="button"
+                        onClick={() => void uploadDraft(file)}
+                      >
+                        Retry
+                      </button>
+                    )}
                     <button
                       type="button"
-                      onClick={() => void uploadDraft(file)}
+                      aria-label={`Remove ${file.name}`}
+                      onClick={() => void removeDraft(file)}
                     >
-                      Retry
+                      ×
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    aria-label={`Remove ${file.name}`}
-                    onClick={() => void removeDraft(file)}
-                  >
-                    ×
-                  </button>
+                  </span>
+                ))}
+              </div>
+              <textarea
+                ref={composerRef}
+                autoFocus
+                aria-label="Message Jossie"
+                value={input}
+                onChange={(event) => {
+                  setInput(event.target.value)
+                }}
+                onKeyDown={composerKeyDown}
+                placeholder="Message Jossie…"
+                rows={2}
+              />
+              <div className="composer-foot">
+                <label className="attach-control">
+                  Attach
+                  <input
+                    type="file"
+                    multiple
+                    onChange={(event) => {
+                      attach(event.target.files)
+                      event.target.value = ''
+                    }}
+                  />
+                </label>
+                <span>
+                  {connection === 'reconnecting'
+                    ? 'Reconnecting—Jossie keeps working…'
+                    : activity}
                 </span>
-              ))}
-            </div>
-            <textarea
-              value={input}
-              onChange={(event) => {
-                setInput(event.target.value)
-                if (retryMessageId.current) retryMessageId.current = null
-              }}
-              onKeyDown={composerKeyDown}
-              placeholder="Message Jossie…"
-              rows={2}
-            />
-            <div className="composer-foot">
-              <label className="attach-control">
-                Attach
-                <input
-                  type="file"
-                  multiple
-                  onChange={(event) => {
-                    attach(event.target.files)
-                    event.target.value = ''
-                  }}
-                />
-              </label>
-              <span>
-                {connection === 'reconnecting'
-                  ? 'Reconnecting—Jossie keeps working…'
-                  : activity}
-              </span>
-              <button
-                className="button primary"
-                disabled={
-                  sending ||
-                  !input.trim() ||
-                  files.some((file) => file.status !== 'ready')
-                }
-              >
-                {sending ? 'Working…' : 'Send'}
-              </button>
-            </div>
-          </form>
+                <button
+                  className="button primary"
+                  disabled={
+                    sending ||
+                    !input.trim() ||
+                    files.some((file) => file.status !== 'ready')
+                  }
+                >
+                  {sending ? 'Working…' : 'Send'}
+                </button>
+              </div>
+            </form>
           )}
           {sending && activeId && (
             <button

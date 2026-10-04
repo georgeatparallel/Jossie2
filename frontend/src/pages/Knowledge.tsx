@@ -1,23 +1,9 @@
-import { useEffect, useMemo } from 'react'
-import { fetchGraph } from '../api'
+import { useState } from 'react'
 import { KnowledgeGraph } from '../components/KnowledgeGraph'
 import { api } from '../config'
-import { useLatestAsync } from '../hooks/useLatestAsync'
-import type { GraphEdge, GraphNode } from '../types'
 
 export function Knowledge() {
-  const { value, error, clearError, run } = useLatestAsync<{
-    nodes: GraphNode[]
-    edges: GraphEdge[]
-  }>({ nodes: [], edges: [] }, 'Unable to load knowledge summary.')
-  useEffect(() => {
-    void run(() => fetchGraph(api, 500))
-  }, [run])
-  const nodes = value.nodes
-  const types = useMemo(
-    () => new Set(nodes.map((node) => node.node_type)).size,
-    [nodes],
-  )
+  const [summary, setSummary] = useState({ count: 0, types: 0 })
   return (
     <section className="page knowledge-page">
       <header className="page-head">
@@ -30,18 +16,15 @@ export function Knowledge() {
           </p>
         </div>
         <div className="knowledge-stats">
-          <span>{nodes.length} entities</span>
-          <span>{types} types</span>
+          <span>{summary.count} matching entities</span>
+          <span>{summary.types} loaded types</span>
         </div>
       </header>
-      {error && (
-        <div className="toast-error" role="alert">
-          {error}
-          <button onClick={clearError}>×</button>
-        </div>
-      )}
       <div className="knowledge-canvas">
-        <KnowledgeGraph apiConfig={api} />
+        <KnowledgeGraph
+          apiConfig={api}
+          onSummary={(count, types) => setSummary({ count, types })}
+        />
       </div>
     </section>
   )

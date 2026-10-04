@@ -15,6 +15,8 @@ pub struct DashboardResponse {
     pub recent_conversations: Vec<jossie_core::Conversation>,
     pub upcoming_tasks: Vec<jossie_db::ScheduledTask>,
     pub graph_highlights: Vec<GraphHighlight>,
+    pub pending_actions: Vec<jossie_db::PendingAction>,
+    pub blocked_goals: Vec<jossie_db::GoalWithTasks>,
 }
 
 #[derive(Serialize, ts_rs::TS)]
@@ -49,6 +51,7 @@ pub async fn dashboard_handler(
         graph_nodes,
         goals,
         active_runs,
+        pending_actions,
     ) = tokio::try_join!(
         state.db.memory_stats(),
         state.db.graph_counts(),
@@ -59,6 +62,7 @@ pub async fn dashboard_handler(
         state.db.graph_central_nodes(5),
         state.db.list_goals(false),
         state.db.list_active_work_runs(None),
+        state.db.list_pending_actions(None),
     )?;
 
     Ok(Json(DashboardResponse {
@@ -82,6 +86,11 @@ pub async fn dashboard_handler(
                 .filter(|goal| goal.goal.status == "blocked")
                 .count(),
         },
+        blocked_goals: goals
+            .into_iter()
+            .filter(|goal| goal.goal.status == "blocked")
+            .collect(),
+        pending_actions,
         recent_memories,
         recent_activity,
         recent_conversations: recent_conversations.into_iter().take(5).collect(),

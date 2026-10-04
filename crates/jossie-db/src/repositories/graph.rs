@@ -1,6 +1,198 @@
 use super::*;
 
+#[derive(Debug, serde::Serialize, ts_rs::TS)]
+pub struct GraphSearchPage {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub total_count: i64,
+    pub next_cursor: Option<String>,
+    pub edges_truncated: bool,
+}
+
+#[derive(Debug, serde::Serialize, ts_rs::TS)]
+pub struct GraphNeighborhoodPage {
+    pub node: GraphNode,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub total_count: i64,
+    pub next_cursor: Option<String>,
+}
+
+fn encode_graph_cursor(value: &impl serde::Serialize) -> anyhow::Result<String> {
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?))
+}
+
+pub fn decode_graph_cursor<T: serde::de::DeserializeOwned>(cursor: &str) -> anyhow::Result<T> {
+    Ok(serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cursor)?,
+    )?)
+}
+
 impl Database {
+    pub async fn graph_search_page(
+        &self,
+        query: &str,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<GraphSearchPage> {
+        let limit = limit.clamp(1, 500);
+        let query = query.trim();
+        let total_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM graph_nodes WHERE instr(lower(label), lower(?)) > 0 OR instr(lower(type), lower(?)) > 0",
+        ).bind(query).bind(query).fetch_one(&self.pool).await?;
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT id, label, type, properties FROM graph_nodes WHERE (instr(lower(label), lower(",
+        );
+        builder
+            .push_bind(query)
+            .push(")) > 0 OR instr(lower(type), lower(")
+            .push_bind(query)
+            .push(")) > 0)");
+        if let Some((label, id)) = after {
+            builder
+                .push(" AND (label COLLATE NOCASE > ")
+                .push_bind(label)
+                .push(" OR (label COLLATE NOCASE = ")
+                .push_bind(label)
+                .push(" AND id > ")
+                .push_bind(id)
+                .push("))");
+        }
+        builder
+            .push(" ORDER BY label COLLATE NOCASE, id LIMIT ")
+            .push_bind((limit + 1) as i64);
+        let mut rows = builder
+            .build_query_as::<GraphNodeRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let nodes: Vec<GraphNode> = rows.into_iter().map(Into::into).collect();
+        let next_cursor = if has_more {
+            nodes
+                .last()
+                .map(|node| encode_graph_cursor(&(&node.label, &node.id)))
+                .transpose()?
+        } else {
+            None
+        };
+        let mut edges = self.graph_edges_between(&nodes, 2001).await?;
+        let edges_truncated = edges.len() > 2000;
+        edges.truncate(2000);
+        Ok(GraphSearchPage {
+            nodes,
+            edges,
+            total_count,
+            next_cursor,
+            edges_truncated,
+        })
+    }
+
+    async fn graph_edges_between(
+        &self,
+        nodes: &[GraphNode],
+        limit: usize,
+    ) -> anyhow::Result<Vec<GraphEdge>> {
+        if nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT id, source_id, target_id, relation, weight, properties FROM graph_edges WHERE source_id IN (",
+        );
+        for (index, node) in nodes.iter().enumerate() {
+            if index > 0 {
+                builder.push(",");
+            }
+            builder.push_bind(&node.id);
+        }
+        builder.push(") AND target_id IN (");
+        for (index, node) in nodes.iter().enumerate() {
+            if index > 0 {
+                builder.push(",");
+            }
+            builder.push_bind(&node.id);
+        }
+        builder.push(") ORDER BY id LIMIT ").push_bind(limit as i64);
+        Ok(builder
+            .build_query_as::<GraphEdgeRow>()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    pub async fn graph_neighborhood_page(
+        &self,
+        node_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Option<GraphNeighborhoodPage>> {
+        let Some(node) = self.graph_get_node(node_id).await? else {
+            return Ok(None);
+        };
+        let limit = limit.clamp(1, 500);
+        let total_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM graph_edges WHERE source_id = ? OR target_id = ?",
+        )
+        .bind(node_id)
+        .bind(node_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query_as::<_, GraphEdgeRow>(
+            "SELECT id, source_id, target_id, relation, weight, properties FROM graph_edges
+             WHERE (source_id = ? OR target_id = ?) AND (? IS NULL OR id > ?)
+             ORDER BY id LIMIT ?",
+        )
+        .bind(node_id)
+        .bind(node_id)
+        .bind(after)
+        .bind(after)
+        .bind((limit + 1) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut edges: Vec<GraphEdge> = rows.into_iter().map(Into::into).collect();
+        let has_more = edges.len() > limit;
+        edges.truncate(limit);
+        let next_cursor = if has_more {
+            edges
+                .last()
+                .map(|edge| encode_graph_cursor(&edge.id))
+                .transpose()?
+        } else {
+            None
+        };
+        let mut ids = HashSet::from([node_id.to_string()]);
+        for edge in &edges {
+            ids.insert(edge.source_id.clone());
+            ids.insert(edge.target_id.clone());
+        }
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT id, label, type, properties FROM graph_nodes WHERE id IN (",
+        );
+        for (index, id) in ids.iter().enumerate() {
+            if index > 0 {
+                builder.push(",");
+            }
+            builder.push_bind(id);
+        }
+        builder.push(") ORDER BY label COLLATE NOCASE, id");
+        let nodes = builder
+            .build_query_as::<GraphNodeRow>()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        Ok(Some(GraphNeighborhoodPage {
+            node,
+            nodes,
+            edges,
+            total_count,
+            next_cursor,
+        }))
+    }
+
     // Knowledge Graph
 
     pub async fn graph_upsert_node(

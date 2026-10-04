@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { PendingAction, WorkRun } from '../types'
 
 export type RunStep = {
@@ -143,7 +143,19 @@ function SecretaryApprovalCard({
 }) {
   const [text, setText] = useState(action.editable_text ?? '')
   const [saving, setSaving] = useState(false)
-  useEffect(() => setText(action.editable_text ?? ''), [action])
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const previousDraft = useRef({
+    id: action.id,
+    text: action.editable_text ?? '',
+  })
+  useEffect(() => {
+    const previous = previousDraft.current
+    const next = action.editable_text ?? ''
+    setText((current) =>
+      previous.id !== action.id || current === previous.text ? next : current,
+    )
+    previousDraft.current = { id: action.id, text: next }
+  }, [action.id, action.editable_text])
   const changed = text.trim() !== (action.editable_text ?? '').trim()
   return (
     <article className={`approval-card ${action.effect} secretary-approval`}>
@@ -163,6 +175,7 @@ function SecretaryApprovalCard({
         />
       </label>
       {action.result_error && <small>{action.result_error}</small>}
+      {saveError && <p role="alert">{saveError}</p>}
       <footer>
         <button
           className="button secondary"
@@ -177,7 +190,16 @@ function SecretaryApprovalCard({
             disabled={!text.trim() || saving}
             onClick={() => {
               setSaving(true)
-              void onDraftUpdate(action, text).finally(() => setSaving(false))
+              setSaveError(null)
+              void onDraftUpdate(action, text)
+                .catch((reason) =>
+                  setSaveError(
+                    reason instanceof Error
+                      ? reason.message
+                      : 'Unable to save this draft.',
+                  ),
+                )
+                .finally(() => setSaving(false))
             }}
           >
             {saving ? 'Saving…' : 'Save edit'}

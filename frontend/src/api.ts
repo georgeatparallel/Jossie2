@@ -455,3 +455,34 @@ export const cancelWorkRun = (config: ApiConfig, runId: string) =>
     `/api/work/runs/${encodeURIComponent(runId)}/cancel`,
     { method: 'POST' },
   )
+
+export const cancelScheduledTask = (config: ApiConfig, id: string) =>
+  request<import('./types').ScheduledTask>(
+    config,
+    `/api/scheduled-tasks/${encodeURIComponent(id)}/cancel`,
+    { method: 'POST' },
+  )
+
+export const searchGraph = (config: ApiConfig, query = '', cursor?: string) => {
+  const params = new URLSearchParams({
+    query,
+    limit: query.trim() ? '150' : '90',
+  })
+  if (cursor) params.set('cursor', cursor)
+  return request<import('./generated/contracts').GraphSearchPage>(
+    config,
+    `/api/graph/search?${params}`,
+  )
+}
+export const getGraphNeighborhood = (
+  config: ApiConfig,
+  id: string,
+  cursor?: string,
+) => {
+  const params = new URLSearchParams({ node_id: id, limit: '100' })
+  if (cursor) params.set('cursor', cursor)
+  return request<import('./generated/contracts').GraphNeighborhoodPage>(
+    config,
+    `/api/graph/neighborhood?${params}`,
+  )
+}

@@ -614,3 +614,178 @@ async fn conversation_lifecycle_and_exports_are_available_over_the_api() {
         .unwrap();
     assert_eq!(delete.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn graph_exploration_is_authenticated_and_validates_cursors() {
+    let (app, db) = setup_app_with_db().await;
+    db.graph_upsert_node("person/ada", "Ada", "Person", &serde_json::json!({}))
+        .await
+        .unwrap();
+    for (uri, expected) in [
+        ("/api/graph/search?query=ada", StatusCode::OK),
+        ("/api/graph/search?cursor=invalid", StatusCode::BAD_REQUEST),
+        (
+            "/api/graph/neighborhood?node_id=person%2Fada",
+            StatusCode::OK,
+        ),
+        (
+            "/api/graph/neighborhood?node_id=missing",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "/api/graph/neighborhood?node_id=person%2Fada&cursor=invalid",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{uri}");
+    }
+    for uri in [
+        "/api/graph/search",
+        "/api/graph/neighborhood?node_id=person%2Fada",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn schedule_cancellation_is_authenticated_idempotent_and_state_aware() {
+    let (app, db) = setup_app_with_db().await;
+    let conv = db.create_conversation(None).await.unwrap();
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        let id = db
+            .create_scheduled_task(
+                conv.id,
+                "agent_run",
+                &serde_json::json!({"prompt":"Check in"}),
+                "interval",
+                "60",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        if index > 0 {
+            db.mark_task_running_if_pending(&id).await.unwrap();
+        }
+        if index == 2 {
+            db.mark_task_completed(&id).await.unwrap();
+        }
+        ids.push(id);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scheduled-tasks/{}/cancel", ids[0]))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    for (id, expected) in [
+        (&ids[0], StatusCode::OK),
+        (&ids[0], StatusCode::OK),
+        (&ids[1], StatusCode::OK),
+        (&ids[2], StatusCode::CONFLICT),
+        (&"missing".to_string(), StatusCode::NOT_FOUND),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/scheduled-tasks/{id}/cancel"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    db.update_task_next_run(&ids[1], &chrono::Utc::now().to_rfc3339(), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_scheduled_task(&ids[1])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_exposes_workspace_attention_without_private_arguments() {
+    let (app, db) = setup_app_with_db().await;
+    let conv = db.create_conversation(None).await.unwrap();
+    let goal = db
+        .create_goal(Some(conv.id), "Plan trip", "Plan a trip", &[])
+        .await
+        .unwrap();
+    db.update_goal_metadata(
+        &goal.goal.id,
+        None,
+        None,
+        Some("blocked"),
+        Some(Some("Choose dates")),
+        None,
+    )
+    .await
+    .unwrap();
+    db.create_pending_action(&jossie_db::NewPendingAction {
+        batch_id: "batch-1".into(),
+        conversation_id: conv.id,
+        run_id: "run-1".into(),
+        call_id: "call-1".into(),
+        tool_name: "mail_send".into(),
+        arguments: "secret arguments".into(),
+        title: "Send trip details".into(),
+        summary: "To Ada".into(),
+        effect: "external_write".into(),
+        kind: "tool_call".into(),
+        editable_text: None,
+        resume_on_resolve: false,
+        source_revision: None,
+    })
+    .await
+    .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/dashboard")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let data: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(data["pending_actions"].as_array().unwrap().len(), 1);
+    assert!(data["pending_actions"][0].get("arguments").is_none());
+    assert_eq!(data["blocked_goals"][0]["blocker"], "Choose dates");
+}

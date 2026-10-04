@@ -1,5 +1,5 @@
-pub mod conversation_runs;
 pub mod agent;
+pub mod conversation_runs;
 pub mod errors;
 pub mod events;
 pub mod handlers;
@@ -90,6 +90,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(handlers::files::get_chat_import),
         )
         .route("/api/graph", get(handlers::graph::graph_handler))
+        .route("/api/graph/search", get(handlers::graph::search))
+        .route(
+            "/api/graph/neighborhood",
+            get(handlers::graph::neighborhood),
+        )
+        .route(
+            "/api/scheduled-tasks/{id}/cancel",
+            post(handlers::scheduler::cancel),
+        )
         .route(
             "/api/dashboard",
             get(handlers::dashboard::dashboard_handler),

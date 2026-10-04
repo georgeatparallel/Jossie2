@@ -1,3 +1,15 @@
+async fn publish_scheduled_task(state: &Arc<AppState>, id: &str) {
+    match state.db.get_scheduled_task(id).await {
+        Ok(Some(task)) => {
+            state
+                .publish_event(ServerEvent::ScheduledTaskUpdated { task })
+                .await;
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!("Failed to publish scheduled task {id}: {error}"),
+    }
+}
+
 async fn process_scheduled_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
     let tasks = state.db.list_pending_scheduled_tasks(10).await?;
 
@@ -11,11 +23,14 @@ async fn process_scheduled_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
             continue;
         }
 
+        publish_scheduled_task(state, &task.id).await;
+
         // Check if max runs exceeded
         if let Some(max) = task.max_runs
             && task.run_count >= max
         {
             state.db.mark_task_completed(&task.id).await?;
+            publish_scheduled_task(state, &task.id).await;
             tracing::info!("Task {} completed (max runs reached)", task.id);
             continue;
         }
@@ -31,6 +46,7 @@ async fn process_scheduled_tasks(state: &Arc<AppState>) -> anyhow::Result<()> {
                     .mark_task_failed(&task_clone.id, &e.to_string())
                     .await;
             }
+            publish_scheduled_task(&state_clone, &task_clone.id).await;
         });
     }
 
@@ -291,12 +307,13 @@ async fn process_oob_messages(state: &Arc<AppState>) -> anyhow::Result<()> {
             created_at: Utc::now(),
         };
         persist_message(state, &assistant_msg).await?;
-        state.publish_event(ServerEvent::BackgroundNotification {
-            conversation_id,
-            source: "oob_message".to_string(),
-            message: assistant_msg.content.clone(),
-        })
-        .await;
+        state
+            .publish_event(ServerEvent::BackgroundNotification {
+                conversation_id,
+                source: "oob_message".to_string(),
+                message: assistant_msg.content.clone(),
+            })
+            .await;
         state.db.mark_oob_message_sent(&msg.id).await?;
         state
             .db

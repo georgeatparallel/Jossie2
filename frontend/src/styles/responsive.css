@@ -157,3 +157,29 @@
     margin-left: 0;
   }
 }
+
+@media (max-width: 760px) {
+  .app-frame {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sidebar-new {
+    min-width: 0;
+    overflow: visible;
+    gap: 0.6rem;
+  }
+  .nav-list {
+    overflow-x: auto;
+    min-width: 0;
+    flex: 1;
+  }
+  .mobile-account {
+    display: block;
+    flex: 0 0 auto;
+  }
+  .attention-summary a {
+    flex-direction: column;
+  }
+  .work-attention {
+    grid-column: auto;
+  }
+}

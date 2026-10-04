@@ -1,9 +1,18 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getDashboard, listConversations, logout } from '../api'
+import { AccountMenu } from '../components/AccountMenu'
 import { WorkPage } from '../components/WorkPage'
 import { api } from '../config'
-import { useWorkspaceEvents, WorkspaceEventProvider } from '../events'
+import {
+  useWorkspaceEvents,
+  WorkspaceEventProvider,
+  useWorkspaceEvent,
+  changesWorkspaceSummary,
+} from '../events'
+import { useQueuedRefresh } from '../hooks/useQueuedRefresh'
+import { navigatePage, useWorkspaceRoute } from '../navigation'
 import type { Page } from '../navigation'
+import { ChatDraftProvider, useDraftStore } from '../hooks/chatDrafts'
 import type { Conversation, Dashboard } from '../types'
 import { Activity } from './Activity'
 import { Chat } from './Chat'
@@ -13,11 +22,14 @@ import { Memories } from './Memories'
 import { Overview } from './Overview'
 
 function WorkspaceContent({ onLogout }: { onLogout: () => void }) {
-  const [page, setPage] = useState<Page>('overview')
+  const route = useWorkspaceRoute()
+  const page = route.page
+  const drafts = useDraftStore()
+  const setPage = (next: Page) => navigatePage(next)
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [error, setError] = useState<string | null>(null)
-  const { sequence } = useWorkspaceEvents()
+  const { resync } = useWorkspaceEvents()
 
   const refresh = useCallback(async () => {
     try {
@@ -40,14 +52,24 @@ function WorkspaceContent({ onLogout }: { onLogout: () => void }) {
   useEffect(() => {
     void refresh()
   }, [refresh])
+  const scheduleRefresh = useQueuedRefresh(refresh)
+  useWorkspaceEvent((event) => {
+    if (changesWorkspaceSummary(event)) scheduleRefresh()
+  })
   useEffect(() => {
-    if (sequence) void refresh()
-  }, [refresh, sequence])
+    if (resync) scheduleRefresh()
+  }, [resync, scheduleRefresh])
 
   const signOut = async () => {
     try {
       await logout(api)
     } finally {
+      drafts.clearAll()
+      try {
+        sessionStorage.removeItem('jossie.last-chat-route')
+      } catch {
+        /* Disabled storage. */
+      }
       onLogout()
     }
   }
@@ -77,13 +99,15 @@ function WorkspaceContent({ onLogout }: { onLogout: () => void }) {
             <button
               key={id}
               onClick={() => setPage(id)}
+              aria-current={page === id ? 'page' : undefined}
               className={page === id ? 'nav-item selected' : 'nav-item'}
             >
-              <span>{icon}</span>
+              <span aria-hidden="true">{icon}</span>
               {label}
             </button>
           ))}
         </nav>
+        <AccountMenu onSignOut={signOut} />
         <div className="sidebar-foot">
           <div className="status-line">
             <i />
@@ -102,11 +126,19 @@ function WorkspaceContent({ onLogout }: { onLogout: () => void }) {
           </div>
         )}
         {page === 'overview' && (
-          <Overview dashboard={dashboard} onNavigate={setPage} />
+          <Overview
+            dashboard={dashboard}
+            onNavigate={setPage}
+            onRefresh={refresh}
+          />
         )}
         {page === 'work' && <WorkPage api={api} />}
         {page === 'chat' && (
-          <Chat conversations={conversations} onRefresh={refresh} />
+          <Chat
+            conversations={conversations}
+            onRefresh={refresh}
+            route={route}
+          />
         )}
         {page === 'memories' && <Memories />}
         {page === 'knowledge' && <Knowledge />}
@@ -119,8 +151,10 @@ function WorkspaceContent({ onLogout }: { onLogout: () => void }) {
 
 export function Workspace({ onLogout }: { onLogout: () => void }) {
   return (
-    <WorkspaceEventProvider api={api}>
-      <WorkspaceContent onLogout={onLogout} />
-    </WorkspaceEventProvider>
+    <ChatDraftProvider>
+      <WorkspaceEventProvider api={api}>
+        <WorkspaceContent onLogout={onLogout} />
+      </WorkspaceEventProvider>
+    </ChatDraftProvider>
   )
 }

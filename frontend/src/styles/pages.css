@@ -245,3 +245,106 @@
     grid-column: auto;
   }
 }
+
+.activity-links,
+.scheduled-task-card footer,
+.blocked-goal {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+}
+.activity-links a,
+.scheduled-task-card a,
+.work-page a {
+  color: #c8ee76;
+  font-size: 0.75rem;
+}
+.activity-links {
+  margin-top: 0.4rem;
+}
+.scheduled-task-card {
+  display: grid;
+  gap: 0.45rem;
+  padding: 1rem 0;
+  border-bottom: 1px solid #292f3a;
+}
+.scheduled-task-card strong {
+  overflow-wrap: anywhere;
+}
+.scheduled-task-card small {
+  color: #8992a0;
+}
+.work-attention {
+  grid-column: 1 / -1;
+}
+.blocked-goal {
+  padding: 1rem 0;
+  align-items: center;
+}
+.blocked-goal strong,
+.blocked-goal p {
+  flex-basis: 100%;
+}
+.attention-summary {
+  display: grid;
+  gap: 0.6rem;
+}
+.attention-summary a {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  color: #c8ee76;
+}
+.attention-summary span {
+  color: #a5aebb;
+}
+.starting-actions {
+  padding: 1.2rem 0;
+}
+.starting-actions > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+}
+.starting-actions p {
+  color: #a5aebb;
+}
+.mobile-account {
+  display: none;
+}
+.account-menu {
+  position: fixed;
+  right: 1rem;
+  top: 4rem;
+  min-width: 10rem;
+  padding: 0.8rem;
+  background: #202733;
+  border: 1px solid #52633c;
+  border-radius: 0.6rem;
+  z-index: 10;
+}
+.account-menu button {
+  width: 100%;
+  padding: 0.6rem;
+  background: transparent;
+  color: #eaf3cf;
+  border: 0;
+  text-align: left;
+}
+
+.operational-list .scheduled-task-card {
+  display: grid;
+}
+.graph-entity-list ul {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 0.7rem;
+  max-height: 15rem;
+  overflow: auto;
+  list-style: none;
+  padding: 0.8rem 0;
+}
+
+.overview-page > .panel-new {
+  margin-bottom: 1rem;
+}

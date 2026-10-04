@@ -7,6 +7,10 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
+    ResyncRequired,
+    ScheduledTaskUpdated {
+        task: jossie_db::ScheduledTask,
+    },
     RunStarted {
         conversation_id: Uuid,
         run_id: String,
@@ -204,7 +208,10 @@ impl ServerEvent {
             | ServerEvent::WorkStepUpdated {
                 conversation_id, ..
             } => *conversation_id,
-            ServerEvent::WorkerStatusUpdated { .. } => None,
+            ServerEvent::ScheduledTaskUpdated { task } => {
+                Uuid::parse_str(&task.conversation_id).ok()
+            }
+            ServerEvent::WorkerStatusUpdated { .. } | ServerEvent::ResyncRequired => None,
         }
     }
 }
@@ -537,6 +544,24 @@ pub async fn persist_work_event(db: &jossie_db::Database, event: &ServerEvent) -
 /// prompts, chain-of-thought, raw tool arguments, or raw tool output.
 pub async fn persist_activity_event(db: &jossie_db::Database, event: &ServerEvent) {
     let summary = match event {
+        ServerEvent::ScheduledTaskUpdated { task } => Some((
+            Uuid::parse_str(&task.conversation_id).ok(),
+            None,
+            "work",
+            match task.status.as_str() {
+                "running" => "Started a scheduled task",
+                "cancelled" => "Cancelled future scheduled runs",
+                "completed" => "Completed a scheduled task",
+                "failed" => "Scheduled task needs attention",
+                _ => "Updated a schedule",
+            },
+            None,
+            if task.status == "failed" {
+                "warning"
+            } else {
+                "normal"
+            },
+        )),
         ServerEvent::RunStarted {
             conversation_id,
             run_id,

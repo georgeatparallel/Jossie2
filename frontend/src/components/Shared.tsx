@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import type { ActivityEvent } from '../types'
+import { chatHref, workHref } from '../navigation'
 import { relativeDate } from '../utils/format'
 
 export function Panel({
@@ -54,6 +55,14 @@ export function ActivityList({
           <div>
             <strong>{event.title}</strong>
             {event.detail && <p>{event.detail}</p>}
+            <div className="activity-links">
+              {event.conversation_id && (
+                <a href={chatHref(event.conversation_id)}>Open conversation</a>
+              )}
+              {event.run_id && (
+                <a href={workHref('run', event.run_id)}>View run</a>
+              )}
+            </div>
           </div>
           <time>{relativeDate(event.created_at)}</time>
         </article>

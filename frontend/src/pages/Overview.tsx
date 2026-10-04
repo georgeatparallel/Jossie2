@@ -1,15 +1,22 @@
 import type { Dashboard } from '../types'
 import type { Page } from '../navigation'
-import { formatDate, initials } from '../utils/format'
+import { initials } from '../utils/format'
 import { ActivityList, Empty, PageLoading, Panel } from '../components/Shared'
+import { api } from '../config'
+import { getDashboard } from '../api'
+import { ScheduledTaskCard } from '../components/ScheduledTaskCard'
+import { StartingActions } from '../components/StartingActions'
+import { workHref } from '../navigation'
 import { MemoryCard } from './Memories'
 
 export function Overview({
   dashboard,
   onNavigate,
+  onRefresh,
 }: {
   dashboard: Dashboard | null
   onNavigate: (page: Page) => void
+  onRefresh?: () => Promise<void>
 }) {
   const hour = new Date().getHours()
   const greeting =
@@ -29,6 +36,36 @@ export function Overview({
           Ask Jossie <span>→</span>
         </button>
       </header>
+      {(dashboard.pending_actions?.length > 0 ||
+        dashboard.blocked_goals?.length > 0) && (
+        <Panel
+          title="Needs your attention"
+          action="Review in Work"
+          onAction={() => onNavigate('work')}
+        >
+          <div className="attention-summary">
+            {(dashboard.pending_actions ?? []).map((action) => (
+              <a key={action.id} href={workHref('run', action.run_id)}>
+                <strong>{action.title}</strong>
+                <span>
+                  {action.status === 'uncertain'
+                    ? 'Outcome needs verification'
+                    : 'Approval needed'}
+                </span>
+              </a>
+            ))}
+            {(dashboard.blocked_goals ?? []).map((goal) => (
+              <a key={goal.id} href={workHref('goal', goal.id)}>
+                <strong>{goal.title}</strong>
+                <span>{goal.blocker || 'Waiting for your input'}</span>
+              </a>
+            ))}
+          </div>
+        </Panel>
+      )}
+      {!dashboard.recent_conversations.length &&
+        !dashboard.stats.memories &&
+        !dashboard.stats.active_goals && <StartingActions />}
       <section className="metric-grid">
         <Metric
           label="Memories"
@@ -105,15 +142,17 @@ export function Overview({
           <div className="task-list">
             {dashboard.upcoming_tasks.length ? (
               dashboard.upcoming_tasks.map((task) => (
-                <div className="task-row" key={task.id}>
-                  <span className="task-dot" />
-                  <div>
-                    <strong>{task.task_type.replace(/_/g, ' ')}</strong>
-                    <small>
-                      {task.schedule_type} · {formatDate(task.next_run_at)}
-                    </small>
-                  </div>
-                </div>
+                <ScheduledTaskCard
+                  key={task.id}
+                  task={task}
+                  api={api}
+                  onChanged={
+                    onRefresh ??
+                    (async () => {
+                      await getDashboard(api)
+                    })
+                  }
+                />
               ))
             ) : (
               <Empty copy="No scheduled work is waiting." />

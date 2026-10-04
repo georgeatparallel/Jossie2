@@ -8,5 +8,6 @@ pub mod files;
 pub mod graph;
 pub mod health;
 pub mod integrations;
+pub mod scheduler;
 pub mod secretary;
 pub mod work;

@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as d3 from 'd3'
-import { fetchGraph } from '../api'
+import { getGraphNeighborhood, searchGraph } from '../api'
+import type {
+  GraphSearchPage,
+  GraphNeighborhoodPage,
+} from '../generated/contracts'
 import type { ApiConfig } from '../api'
 import type { GraphEdge, GraphNode } from '../types'
 
-type KnowledgeGraphProps = { apiConfig: ApiConfig }
+type KnowledgeGraphProps = {
+  apiConfig: ApiConfig
+  onSummary?: (count: number, types: number) => void
+}
 type SimulationNode = GraphNode & d3.SimulationNodeDatum
 type SimulationLink = GraphEdge & d3.SimulationLinkDatum<SimulationNode>
 type GraphConnection = {
@@ -13,8 +20,6 @@ type GraphConnection = {
   direction: 'outgoing' | 'incoming'
 }
 
-const INITIAL_NODE_LIMIT = 90
-const FILTERED_NODE_LIMIT = 150
 const palette = [
   '#c8ee76',
   '#8fc7c3',
@@ -35,40 +40,173 @@ const readableRelation = (relation: string) =>
     .toLowerCase()
     .replace(/^./, (letter) => letter.toUpperCase()) || 'Related to'
 
-export function KnowledgeGraph({ apiConfig }: KnowledgeGraphProps) {
+export function KnowledgeGraph({ apiConfig, onSummary }: KnowledgeGraphProps) {
   const graphRef = useRef<HTMLDivElement>(null)
-  const [data, setData] = useState<{
-    nodes: GraphNode[]
-    edges: GraphEdge[]
-  } | null>(null)
+  const [data, setData] = useState<GraphSearchPage | null>(null)
+  const [neighborhood, setNeighborhood] =
+    useState<GraphNeighborhoodPage | null>(null)
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [neighborhoodError, setNeighborhoodError] = useState<string | null>(
+    null,
+  )
+  const [neighborhoodLoading, setNeighborhoodLoading] = useState(false)
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
   const [viewport, setViewport] = useState({ width: 0, height: 0 })
   const colorScale = useRef(d3.scaleOrdinal<string, string>().range(palette))
+  const searchGeneration = useRef(0)
+  const neighborhoodGeneration = useRef(0)
+  const searchBusy = useRef(false)
+  const neighborhoodBusy = useRef(false)
+  const currentFilter = useRef(filter)
+  currentFilter.current = filter
+  const currentNodeId = useRef(selectedNode?.id)
+  currentNodeId.current = selectedNode?.id
+  const summary = useRef(onSummary)
+  summary.current = onSummary
 
-  const loadGraph = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const result = await fetchGraph(apiConfig, 500)
-      setData(result)
-    } catch (reason) {
-      setData(null)
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : 'Unable to load the knowledge graph.',
-      )
-    } finally {
-      setLoading(false)
-    }
-  }, [apiConfig])
+  const loadGraph = useCallback(
+    async (cursor?: string) => {
+      if (cursor && searchBusy.current) return
+      const query = currentFilter.current
+      const request = ++searchGeneration.current
+      searchBusy.current = true
+      setLoading(true)
+      try {
+        const result = await searchGraph(apiConfig, query, cursor)
+        if (
+          request !== searchGeneration.current ||
+          query !== currentFilter.current
+        )
+          return
+        setData((previous) =>
+          cursor && previous
+            ? {
+                ...result,
+                nodes: [
+                  ...previous.nodes,
+                  ...result.nodes.filter(
+                    (node) => !previous.nodes.some((old) => old.id === node.id),
+                  ),
+                ],
+                edges: [
+                  ...previous.edges,
+                  ...result.edges.filter(
+                    (edge) => !previous.edges.some((old) => old.id === edge.id),
+                  ),
+                ],
+                edges_truncated:
+                  previous.edges_truncated || result.edges_truncated,
+              }
+            : result,
+        )
+        setError(null)
+      } catch (reason) {
+        if (
+          request === searchGeneration.current &&
+          query === currentFilter.current
+        )
+          setError(
+            reason instanceof Error
+              ? reason.message
+              : 'Unable to load the knowledge graph.',
+          )
+      } finally {
+        if (request === searchGeneration.current) {
+          searchBusy.current = false
+          setLoading(false)
+        }
+      }
+    },
+    [apiConfig],
+  )
 
+  const invalidateSearch = useCallback(() => {
+    searchGeneration.current++
+  }, [])
+  const invalidateNeighborhood = useCallback(() => {
+    neighborhoodGeneration.current++
+  }, [])
   useEffect(() => {
-    void loadGraph()
-  }, [loadGraph])
+    // Invalidate a pending response immediately, before the debounce fires.
+    searchGeneration.current++
+    setData(null)
+    setLoading(true)
+    const timer = window.setTimeout(() => void loadGraph(), filter ? 180 : 0)
+    return () => {
+      clearTimeout(timer)
+      invalidateSearch()
+    }
+  }, [filter, loadGraph, invalidateSearch])
+  const loadNeighborhood = useCallback(
+    async (cursor?: string) => {
+      const id = currentNodeId.current
+      if (!id || (cursor && neighborhoodBusy.current)) return
+      const request = ++neighborhoodGeneration.current
+      neighborhoodBusy.current = true
+      setNeighborhoodLoading(true)
+      try {
+        const result = await getGraphNeighborhood(apiConfig, id, cursor)
+        if (
+          request !== neighborhoodGeneration.current ||
+          id !== currentNodeId.current
+        )
+          return
+        setNeighborhood((previous) =>
+          cursor && previous
+            ? {
+                ...result,
+                nodes: [
+                  ...previous.nodes,
+                  ...result.nodes.filter(
+                    (node) => !previous.nodes.some((old) => old.id === node.id),
+                  ),
+                ],
+                edges: [
+                  ...previous.edges,
+                  ...result.edges.filter(
+                    (edge) => !previous.edges.some((old) => old.id === edge.id),
+                  ),
+                ],
+              }
+            : result,
+        )
+        setSelectedNode(result.node)
+        setNeighborhoodError(null)
+      } catch (reason) {
+        if (
+          request === neighborhoodGeneration.current &&
+          id === currentNodeId.current
+        )
+          setNeighborhoodError(
+            reason instanceof Error
+              ? reason.message
+              : 'Unable to load relationships.',
+          )
+      } finally {
+        if (request === neighborhoodGeneration.current) {
+          neighborhoodBusy.current = false
+          setNeighborhoodLoading(false)
+        }
+      }
+    },
+    [apiConfig],
+  )
+  useEffect(() => {
+    neighborhoodGeneration.current++
+    setNeighborhood(null)
+    setNeighborhoodError(null)
+    setNeighborhoodLoading(false)
+    if (selectedNode?.id) void loadNeighborhood()
+    return invalidateNeighborhood
+  }, [selectedNode?.id, loadNeighborhood, invalidateNeighborhood])
+  useEffect(() => {
+    summary.current?.(
+      data?.total_count ?? 0,
+      new Set(data?.nodes.map((node) => node.node_type) ?? []).size,
+    )
+  }, [data])
 
   useEffect(() => {
     const element = graphRef.current
@@ -83,68 +221,45 @@ export function KnowledgeGraph({ apiConfig }: KnowledgeGraphProps) {
 
   const graph = useMemo(() => {
     if (!data) return null
-    const term = filter.trim().toLowerCase()
-    const candidates = term
-      ? data.nodes.filter(
-          (node) =>
-            node.label.toLowerCase().includes(term) ||
-            node.node_type.toLowerCase().includes(term),
-        )
-      : data.nodes
-    const initialNodes = candidates.slice(
-      0,
-      term ? FILTERED_NODE_LIMIT : INITIAL_NODE_LIMIT,
-    )
-    const expandedIds = new Set<string>()
-    if (selectedNode) {
-      expandedIds.add(selectedNode.id)
-      data.edges.forEach((edge) => {
-        if (edge.source_id === selectedNode.id) expandedIds.add(edge.target_id)
-        if (edge.target_id === selectedNode.id) expandedIds.add(edge.source_id)
-      })
-    }
-    const initialIds = new Set(initialNodes.map((node) => node.id))
-    const expandedNodes = data.nodes.filter(
-      (node) => expandedIds.has(node.id) && !initialIds.has(node.id),
-    )
-    const visibleNodes = [...initialNodes, ...expandedNodes]
-    const visibleIds = new Set(visibleNodes.map((node) => node.id))
+    const nodes = new Map(data.nodes.map((node) => [node.id, node]))
+    neighborhood?.nodes.forEach((node) => nodes.set(node.id, node))
+    if (selectedNode) nodes.set(selectedNode.id, selectedNode)
+    const edges = new Map(data.edges.map((edge) => [edge.id, edge]))
+    neighborhood?.edges.forEach((edge) => edges.set(edge.id, edge))
     return {
-      nodes: visibleNodes,
-      edges: data.edges.filter(
-        (edge) =>
-          visibleIds.has(edge.source_id) && visibleIds.has(edge.target_id),
-      ),
-      isLimited: candidates.length > visibleNodes.length,
-      matchingCount: candidates.length,
-      expandedNodeCount: expandedNodes.length,
+      nodes: [...nodes.values()],
+      edges: [...edges.values()],
+      isLimited: !!data.next_cursor,
+      matchingCount: data.total_count,
+      expandedNodeCount: [...nodes.keys()].filter(
+        (id) => !data.nodes.some((node) => node.id === id),
+      ).length,
     }
-  }, [data, filter, selectedNode])
-
-  const types = useMemo(() => {
-    if (!graph) return []
-    return Array.from(
-      new Set(graph.nodes.map((node) => node.node_type || 'Unknown')),
-    ).slice(0, 8)
-  }, [graph])
-
+  }, [data, neighborhood, selectedNode])
+  const types = useMemo(
+    () =>
+      Array.from(
+        new Set(graph?.nodes.map((node) => node.node_type || 'Unknown') ?? []),
+      ).slice(0, 8),
+    [graph],
+  )
   const selectedConnections = useMemo<GraphConnection[]>(() => {
-    if (!data || !selectedNode) return []
-    const nodesById = new Map(data.nodes.map((node) => [node.id, node]))
-    return data.edges
+    if (!neighborhood || !selectedNode) return []
+    const nodes = new Map(neighborhood.nodes.map((node) => [node.id, node]))
+    return neighborhood.edges
       .flatMap<GraphConnection>((edge) => {
-        if (edge.source_id === selectedNode.id) {
-          const node = nodesById.get(edge.target_id)
-          return node ? [{ edge, node, direction: 'outgoing' as const }] : []
-        }
-        if (edge.target_id === selectedNode.id) {
-          const node = nodesById.get(edge.source_id)
-          return node ? [{ edge, node, direction: 'incoming' as const }] : []
-        }
-        return []
+        const outgoing = edge.source_id === selectedNode.id
+        const node = nodes.get(outgoing ? edge.target_id : edge.source_id)
+        return node
+          ? [{ edge, node, direction: outgoing ? 'outgoing' : 'incoming' }]
+          : []
       })
-      .sort((left, right) => left.node.label.localeCompare(right.node.label))
-  }, [data, selectedNode])
+      .sort(
+        (a, b) =>
+          a.node.label.localeCompare(b.node.label) ||
+          a.edge.id.localeCompare(b.edge.id),
+      )
+  }, [neighborhood, selectedNode])
 
   useEffect(() => {
     if (
@@ -336,7 +451,10 @@ export function KnowledgeGraph({ apiConfig }: KnowledgeGraphProps) {
         </div>
         <button
           className="button secondary graph-refresh"
-          onClick={() => void loadGraph()}
+          onClick={() => {
+            void loadGraph()
+            if (selectedNode) void loadNeighborhood()
+          }}
           disabled={loading}
         >
           {loading ? 'Loading…' : 'Refresh'}
@@ -355,9 +473,46 @@ export function KnowledgeGraph({ apiConfig }: KnowledgeGraphProps) {
           {graph?.expandedNodeCount ? (
             <span>{graph.expandedNodeCount} connected nodes expanded</span>
           ) : null}
-          {graph?.isLimited && <span>Refine search to see more</span>}
+          <span>
+            {data?.nodes.length ?? 0} of {data?.total_count ?? 0} matching
+            entities loaded
+          </span>
+          {graph?.isLimited && <span>More matching entities available</span>}
+          {data?.edges_truncated && (
+            <span>Map relationships are partially loaded</span>
+          )}
         </div>
       </div>
+      {data?.next_cursor && (
+        <button
+          className="button secondary"
+          disabled={loading}
+          onClick={() => void loadGraph(data.next_cursor ?? undefined)}
+        >
+          Load more entities
+        </button>
+      )}
+      <p className="muted-copy">
+        Map links cover each loaded result page. Select an entity to load its
+        relationships.
+      </p>
+      {!!data?.nodes.length && (
+        <details className="graph-entity-list">
+          <summary>Browse loaded entities</summary>
+          <ul>
+            {data.nodes.map((node) => (
+              <li key={node.id}>
+                <button
+                  className="text-button"
+                  onClick={() => setSelectedNode(node)}
+                >
+                  {node.label} · {node.node_type}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
       <div className="knowledge-workspace">
         <div className="knowledge-map-wrap">
           {types.length > 0 && (
@@ -377,7 +532,7 @@ export function KnowledgeGraph({ apiConfig }: KnowledgeGraphProps) {
             {error && <div className="knowledge-empty error">{error}</div>}
             {!loading && !error && graph?.nodes.length === 0 && (
               <div className="knowledge-empty">
-                No entities match this filter.
+                No entities match this search.
               </div>
             )}
             {!loading &&
@@ -406,8 +561,20 @@ export function KnowledgeGraph({ apiConfig }: KnowledgeGraphProps) {
                 aria-label={`Connections for ${selectedNode.label}`}
               >
                 <p className="inspector-section-label">
-                  CONNECTED ENTITIES ({selectedConnections.length})
+                  RELATIONSHIPS ({selectedConnections.length} of{' '}
+                  {neighborhood?.total_count ?? 0} loaded)
                 </p>
+                {neighborhoodLoading && (
+                  <p role="status">Loading relationships…</p>
+                )}
+                {neighborhoodError && (
+                  <p role="alert">
+                    {neighborhoodError}{' '}
+                    <button onClick={() => void loadNeighborhood()}>
+                      Retry relationships
+                    </button>
+                  </p>
+                )}
                 {selectedConnections.length ? (
                   <ul>
                     {selectedConnections.map(({ edge, node, direction }) => (
@@ -426,10 +593,25 @@ export function KnowledgeGraph({ apiConfig }: KnowledgeGraphProps) {
                       </li>
                     ))}
                   </ul>
-                ) : (
+                ) : !neighborhoodLoading &&
+                  !neighborhoodError &&
+                  neighborhood ? (
                   <p className="inspector-empty">
                     No connected entities are stored for this node.
                   </p>
+                ) : null}
+                {neighborhood?.next_cursor && (
+                  <button
+                    className="button secondary"
+                    disabled={neighborhoodLoading}
+                    onClick={() =>
+                      void loadNeighborhood(
+                        neighborhood.next_cursor ?? undefined,
+                      )
+                    }
+                  >
+                    Load more relationships
+                  </button>
                 )}
               </section>
               {selectedNode.properties &&

@@ -485,8 +485,10 @@ async fn handle_events_ws(
     loop {
         tokio::select! {
             event = rx.recv() => {
-                let Ok(event) = event else {
-                    continue;
+                let event = match event {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => crate::ServerEvent::ResyncRequired,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
                 if let Some(filter) = conversation_filter
                     && event.conversation_id().is_some_and(|conversation_id| conversation_id != filter)

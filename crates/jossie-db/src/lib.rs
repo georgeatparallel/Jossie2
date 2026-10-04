@@ -457,6 +457,7 @@ mod conversations;
 mod files_actions;
 #[path = "repositories/graph.rs"]
 mod graph;
+pub use graph::{GraphNeighborhoodPage, GraphSearchPage, decode_graph_cursor};
 #[path = "repositories/integrations.rs"]
 mod integrations;
 #[path = "repositories/memory.rs"]

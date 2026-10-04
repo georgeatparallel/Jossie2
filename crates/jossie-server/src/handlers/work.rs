@@ -42,7 +42,7 @@ pub async fn work_summary(
             query.before.as_deref(),
         ),
         state.db.list_worker_statuses(),
-        state.db.list_upcoming_scheduled_tasks(50),
+        state.db.list_active_scheduled_tasks(50),
         state.db.list_recent_chat_imports(20),
     )?;
     Ok(Json(WorkSummary {

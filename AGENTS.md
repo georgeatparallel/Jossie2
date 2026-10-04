@@ -159,7 +159,9 @@ Current API surface:
 | `/api/conversations/{id}/export` | `GET` | visible transcript as Markdown or JSON |
 | `/api/files`, `/api/files/{id}` | `POST`, `GET`, `DELETE` | upload, download, or remove an unused file |
 | `/api/chat-imports` | `POST` | start a chat-export import |
-| `/api/graph` | `GET` | returns graph nodes/edges, optional `?limit=` |
+| `/api/graph` | `GET` | legacy graph nodes/edges, optional `?limit=` |
+| `/api/graph/search`, `/api/graph/neighborhood` | `GET` | database-wide entity search and paginated relationships with explicit partial-result metadata |
+| `/api/scheduled-tasks/{id}/cancel` | `POST` | cancel future executions; an already running execution uses the separate run stop control |
 | `/api/dashboard`, `/api/memories`, `/api/activity` | `GET` | browser workspace data |
 | `/api/work`, `/api/goals/{id}`, `/api/work/runs/{id}` | `GET` | durable work, goal, and run state |
 | `/api/actions/pending` | `GET` | pending external-action approvals |

@@ -1356,3 +1356,195 @@ async fn queued_work_run_can_only_be_claimed_once() {
         "running"
     );
 }
+
+#[tokio::test]
+async fn cancelled_schedules_cannot_be_claimed_or_restored_by_workers() {
+    let db = test_db().await;
+    let conv = db.create_conversation(None).await.unwrap();
+    for running in [false, true] {
+        let id = db
+            .create_scheduled_task(
+                conv.id,
+                "agent_run",
+                &serde_json::json!({"prompt":"Check in"}),
+                "interval",
+                "60",
+                Some(&Utc::now().to_rfc3339()),
+                None,
+            )
+            .await
+            .unwrap();
+        if running {
+            assert!(db.mark_task_running_if_pending(&id).await.unwrap());
+        }
+        assert!(db.cancel_active_scheduled_task(&id).await.unwrap());
+        assert!(!db.cancel_active_scheduled_task(&id).await.unwrap());
+        assert!(!db.mark_task_running_if_pending(&id).await.unwrap());
+        db.update_task_next_run(&id, &Utc::now().to_rfc3339(), false)
+            .await
+            .unwrap();
+        db.update_task_next_run(&id, &Utc::now().to_rfc3339(), true)
+            .await
+            .unwrap();
+        db.mark_task_completed(&id).await.unwrap();
+        db.mark_task_failed(&id, "Execution failed").await.unwrap();
+        let task = db.get_scheduled_task(&id).await.unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
+        assert_eq!(task.run_count, 0);
+        assert!(task.last_error.is_none());
+    }
+    assert!(db.list_active_scheduled_tasks(50).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn schedule_lists_honor_limits_and_include_running_work() {
+    let db = test_db().await;
+    let conv = db.create_conversation(None).await.unwrap();
+    for index in 0..30 {
+        let id = db
+            .create_scheduled_task(
+                conv.id,
+                "agent_run",
+                &serde_json::json!({"prompt":"Check in"}),
+                "once",
+                "later",
+                Some(&Utc::now().to_rfc3339()),
+                None,
+            )
+            .await
+            .unwrap();
+        if index == 0 {
+            db.mark_task_running_if_pending(&id).await.unwrap();
+        }
+    }
+    assert_eq!(
+        db.list_upcoming_scheduled_tasks(50).await.unwrap().len(),
+        29
+    );
+    assert_eq!(db.list_active_scheduled_tasks(50).await.unwrap().len(), 30);
+}
+
+#[tokio::test]
+async fn graph_search_reaches_old_entities_and_pages_tied_labels() {
+    let db = test_db().await;
+    db.graph_upsert_node(
+        "old",
+        "Ancient 100%_record",
+        "Person",
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    for index in 0..510 {
+        db.graph_upsert_node(
+            &format!("new-{index:03}"),
+            "Same label",
+            "Project",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        !db.graph_list_nodes(500)
+            .await
+            .unwrap()
+            .iter()
+            .any(|node| node.id == "old")
+    );
+    let found = db.graph_search_page("100%_", None, 10).await.unwrap();
+    assert_eq!(found.total_count, 1);
+    assert_eq!(found.nodes[0].id, "old");
+    assert_eq!(
+        db.graph_search_page("PERSON", None, 10)
+            .await
+            .unwrap()
+            .total_count,
+        1
+    );
+    let first = db.graph_search_page("project", None, 200).await.unwrap();
+    let cursor: (String, String) =
+        decode_graph_cursor(first.next_cursor.as_deref().unwrap()).unwrap();
+    let next = db
+        .graph_search_page("project", Some((&cursor.0, &cursor.1)), 200)
+        .await
+        .unwrap();
+    assert_eq!(first.nodes.len(), 200);
+    assert_eq!(next.nodes.len(), 200);
+    assert!(
+        !first
+            .nodes
+            .iter()
+            .any(|node| next.nodes.iter().any(|other| node.id == other.id))
+    );
+    let cursor: (String, String) =
+        decode_graph_cursor(next.next_cursor.as_deref().unwrap()).unwrap();
+    let last = db
+        .graph_search_page("project", Some((&cursor.0, &cursor.1)), 200)
+        .await
+        .unwrap();
+    assert_eq!(last.nodes.len(), 110);
+    assert!(last.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn graph_neighborhood_includes_all_edge_endpoints_and_pages_self_links_once() {
+    let db = test_db().await;
+    for (id, label) in [("root", "Root"), ("other", "Other")] {
+        db.graph_upsert_node(id, label, "Person", &serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    db.graph_upsert_edge("root", "root", "self", 1.0, &serde_json::json!({}))
+        .await
+        .unwrap();
+    db.graph_upsert_edge("root", "other", "knows", 1.0, &serde_json::json!({}))
+        .await
+        .unwrap();
+    db.graph_upsert_edge("other", "root", "works_with", 1.0, &serde_json::json!({}))
+        .await
+        .unwrap();
+    let first = db
+        .graph_neighborhood_page("root", None, 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.total_count, 3);
+    let cursor: String = decode_graph_cursor(first.next_cursor.as_deref().unwrap()).unwrap();
+    let next = db
+        .graph_neighborhood_page("root", Some(&cursor), 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.edges.len(), 1);
+    assert!(next.next_cursor.is_none());
+    for page in [&first, &next] {
+        for edge in &page.edges {
+            assert!(page.nodes.iter().any(|node| node.id == edge.source_id));
+            assert!(page.nodes.iter().any(|node| node.id == edge.target_id));
+        }
+    }
+    assert!(
+        db.graph_neighborhood_page("missing", None, 10)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn graph_search_labels_truncated_relationships() {
+    let db = test_db().await;
+    db.graph_upsert_node("root", "Root", "Person", &serde_json::json!({}))
+        .await
+        .unwrap();
+    let mut transaction = db.pool.begin().await.unwrap();
+    for index in 0..2005 {
+        sqlx::query("INSERT INTO graph_edges (id, source_id, target_id, relation, weight, properties) VALUES (?, 'root', 'root', ?, 1, '{}')")
+            .bind(format!("edge-{index:04}")).bind(format!("relation-{index}")).execute(&mut *transaction).await.unwrap();
+    }
+    transaction.commit().await.unwrap();
+    let page = db.graph_search_page("", None, 90).await.unwrap();
+    assert_eq!(page.edges.len(), 2000);
+    assert!(page.edges_truncated);
+}
