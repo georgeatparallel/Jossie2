@@ -17,20 +17,26 @@ impl LlmClient {
     ) -> anyhow::Result<LlmOutput> {
         let req = self.build_request(messages, tools, false, options);
 
-        let resp = self
-            .send_responses_request(&req, options.max_rate_limit_retries)
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("LLM API error {status}: {body}");
+        let mut retry_count = 0usize;
+        loop {
+            let result = async {
+                let response = self.send_responses_request(&req, options).await?;
+                collect_response_output(response.json().await?)
+            }
+            .await;
+            match result {
+                Ok(output) => {
+                    trace_usage("non_streaming", output.usage.as_ref());
+                    return Ok(output);
+                }
+                Err(error) => {
+                    if !self.wait_to_retry(&error, options, retry_count).await {
+                        return Err(error);
+                    }
+                    retry_count = retry_count.saturating_add(1);
+                }
+            }
         }
-
-        let response: ResponsesResponse = resp.json().await?;
-        let output = collect_response_output(response)?;
-        trace_usage("non_streaming", output.usage.as_ref());
-        Ok(output)
     }
 
     /// Streaming completion. Sends events to the channel.
@@ -53,32 +59,40 @@ impl LlmClient {
     ) -> anyhow::Result<()> {
         let req = self.build_request(messages, tools, true, options);
 
-        let resp = match self
-            .send_responses_request(&req, options.max_rate_limit_retries)
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                let _ = tx
-                    .send(StreamEvent::Error(format!(
-                        "LLM request failed before streaming started: {e}"
-                    )))
-                    .await;
+        let mut retry_count = 0usize;
+        loop {
+            let mut emitted_output = false;
+            let result = tokio::select! {
+                _ = tx.closed() => return Ok(()),
+                result = self.stream_attempt(&req, options, &tx, &mut emitted_output) => result,
+            };
+            let Err(error) = result else {
+                return Ok(());
+            };
+            tokio::select! {
+                _ = tx.closed() => return Ok(()),
+                retry = self.wait_to_retry(&error, options, retry_count) => {
+                    if !retry {
+                        let _ = tx.send(StreamEvent::Error(error.to_string())).await;
+                        return Ok(());
+                    }
+                }
+            }
+            if emitted_output && tx.send(StreamEvent::Reset).await.is_err() {
                 return Ok(());
             }
-        };
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let _ = tx
-                .send(StreamEvent::Error(format!(
-                    "LLM API error {status}: {body}"
-                )))
-                .await;
-            return Ok(());
+            retry_count = retry_count.saturating_add(1);
         }
+    }
 
+    async fn stream_attempt(
+        &self,
+        request: &ResponsesRequest,
+        options: &LlmRequestOptions,
+        tx: &mpsc::Sender<StreamEvent>,
+        emitted_output: &mut bool,
+    ) -> anyhow::Result<()> {
+        let resp = self.send_responses_request(request, options).await?;
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
         let mut pending_calls: HashMap<i32, PendingToolCall> = HashMap::new();
@@ -87,17 +101,7 @@ impl LlmClient {
         let mut response_metadata = StreamResponseMetadata::default();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(e) => {
-                    let _ = tx
-                        .send(StreamEvent::Error(format!(
-                            "LLM stream transport error: {e}"
-                        )))
-                        .await;
-                    return Ok(());
-                }
-            };
+            let chunk = chunk?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(line_end) = buffer.find('\n') {
@@ -114,14 +118,22 @@ impl LlmClient {
                     break;
                 }
 
+                let event: Value = serde_json::from_str(data).unwrap_or(Value::Null);
+                if event["type"] == "response.output_text.delta" {
+                    *emitted_output = true;
+                }
                 handle_stream_event(
                     data,
                     &mut pending_calls,
                     &mut completed_items,
                     &mut response_metadata,
-                    &tx,
+                    tx,
                 )
-                .await;
+                .await?;
+                if response_metadata.completed {
+                    done_received = true;
+                    break;
+                }
             }
 
             if done_received {
@@ -129,6 +141,12 @@ impl LlmClient {
             }
         }
 
+        if !response_metadata.completed {
+            return Err(generation_failure(
+                "LLM stream ended before generation completed".into(),
+                None,
+            ));
+        }
         let calls = collect_tool_calls(pending_calls);
         let response_items = collect_response_items(completed_items);
         trace_usage("streaming", response_metadata.usage.as_ref());
@@ -156,7 +174,10 @@ fn tool_calls_from_message(message: &Message) -> Option<Vec<ToolCall>> {
 
 fn collect_response_output(response: ResponsesResponse) -> anyhow::Result<LlmOutput> {
     if let Some(error) = response.error {
-        anyhow::bail!("LLM API error: {}", error.message);
+        return Err(generation_failure(
+            format!("LLM API error: {}", error.message),
+            error.code.as_deref(),
+        ));
     }
 
     let mut content = String::new();
@@ -225,6 +246,7 @@ fn trace_usage(kind: &str, usage: Option<&ResponseUsage>) {
 
 #[derive(Default)]
 struct StreamResponseMetadata {
+    completed: bool,
     response_id: Option<String>,
     usage: Option<ResponseUsage>,
 }
@@ -235,13 +257,13 @@ async fn handle_stream_event(
     completed_items: &mut HashMap<i32, Value>,
     response_metadata: &mut StreamResponseMetadata,
     tx: &mpsc::Sender<StreamEvent>,
-) {
+) -> anyhow::Result<()> {
     let Ok(value) = serde_json::from_str::<Value>(data) else {
-        return;
+        return Ok(());
     };
 
     let Some(event_type) = value.get("type").and_then(Value::as_str) else {
-        return;
+        return Ok(());
     };
 
     match event_type {
@@ -254,13 +276,13 @@ async fn handle_stream_event(
         }
         "response.output_item.added" => {
             let Some(index) = value.get("output_index").and_then(Value::as_i64) else {
-                return;
+                return Ok(());
             };
             let Some(item) = value.get("item") else {
-                return;
+                return Ok(());
             };
             if item.get("type").and_then(Value::as_str) != Some("function_call") {
-                return;
+                return Ok(());
             }
 
             let entry = pending_calls.entry(index as i32).or_default();
@@ -278,7 +300,7 @@ async fn handle_stream_event(
         }
         "response.function_call_arguments.delta" => {
             let Some(index) = value.get("output_index").and_then(Value::as_i64) else {
-                return;
+                return Ok(());
             };
             let entry = pending_calls.entry(index as i32).or_default();
             if let Some(call_id) = value.get("call_id").and_then(Value::as_str) {
@@ -290,7 +312,7 @@ async fn handle_stream_event(
         }
         "response.function_call_arguments.done" => {
             let Some(index) = value.get("output_index").and_then(Value::as_i64) else {
-                return;
+                return Ok(());
             };
             let entry = pending_calls.entry(index as i32).or_default();
             if let Some(call_id) = value.get("call_id").and_then(Value::as_str) {
@@ -305,17 +327,18 @@ async fn handle_stream_event(
         }
         "response.output_item.done" => {
             let Some(index) = value.get("output_index").and_then(Value::as_i64) else {
-                return;
+                return Ok(());
             };
             let Some(item) = value.get("item") else {
-                return;
+                return Ok(());
             };
             completed_items.insert(index as i32, item.clone());
         }
         "response.completed" => {
             let Some(response) = value.get("response") else {
-                return;
+                return Ok(());
             };
+            response_metadata.completed = true;
             response_metadata.response_id = response
                 .get("id")
                 .and_then(Value::as_str)
@@ -325,17 +348,30 @@ async fn handle_stream_event(
                 .cloned()
                 .and_then(|usage| serde_json::from_value(usage).ok());
         }
-        "error" => {
-            let message = value
-                .get("error")
-                .and_then(|error| error.get("message"))
+        "error" | "response.failed" | "response.incomplete" => {
+            let error = value
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .or_else(|| value.get("error"))
+                .unwrap_or(&value);
+            let message = error
+                .get("message")
                 .and_then(Value::as_str)
-                .or_else(|| value.get("message").and_then(Value::as_str))
-                .unwrap_or("unknown streaming error");
-            let _ = tx.send(StreamEvent::Error(message.to_string())).await;
+                .unwrap_or("LLM generation failed before completing");
+            return Err(generation_failure(
+                message.to_string(),
+                error.get("code").and_then(Value::as_str).or_else(|| {
+                    value
+                        .get("response")?
+                        .get("incomplete_details")?
+                        .get("reason")?
+                        .as_str()
+                }),
+            ));
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn collect_response_items(mut items: HashMap<i32, Value>) -> Vec<Value> {

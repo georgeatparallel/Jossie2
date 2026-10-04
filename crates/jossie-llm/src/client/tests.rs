@@ -13,6 +13,8 @@ mod tests {
     struct RateLimitTestState {
         attempts: Arc<AtomicUsize>,
         failures_before_success: usize,
+        failure_status: axum::http::StatusCode,
+        stream_failure: bool,
     }
 
     async fn rate_limited_responses_handler(
@@ -23,8 +25,17 @@ mod tests {
 
         let attempt = state.attempts.fetch_add(1, Ordering::SeqCst);
         if attempt < state.failures_before_success {
+            if state.stream_failure {
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    concat!(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"discard me\"}\n\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"try later\"}}}\n\n"
+                    ),
+                ).into_response();
+            }
             return (
-                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                state.failure_status,
                 [(axum::http::header::RETRY_AFTER, "0")],
                 axum::Json(json!({
                     "error": {
@@ -62,16 +73,29 @@ mod tests {
     async fn spawn_rate_limited_responses_server(
         failures_before_success: usize,
     ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        spawn_failing_responses_server(
+            failures_before_success,
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            false,
+        )
+        .await
+    }
+
+    async fn spawn_failing_responses_server(
+        failures_before_success: usize,
+        failure_status: axum::http::StatusCode,
+        stream_failure: bool,
+    ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
         use axum::{Router, routing::post};
 
         let attempts = Arc::new(AtomicUsize::new(0));
         let state = RateLimitTestState {
             attempts: attempts.clone(),
             failures_before_success,
+            failure_status,
+            stream_failure,
         };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(
@@ -533,7 +557,8 @@ mod tests {
             &mut response_metadata,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
         handle_stream_event(
             &json!({
                 "type": "response.output_item.done",
@@ -546,7 +571,8 @@ mod tests {
             &mut response_metadata,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
         handle_stream_event(
             &json!({
                 "type": "response.completed",
@@ -567,7 +593,8 @@ mod tests {
             &mut response_metadata,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
 
         let items = collect_response_items(completed_items);
         assert_eq!(items[0]["type"], "reasoning");
@@ -591,31 +618,37 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "17".parse().unwrap());
         assert_eq!(
-            rate_limit_retry_delay(&headers, 0),
+            generation_retry_delay(retry_after_delay(&headers), 0),
             std::time::Duration::from_secs(17)
         );
 
         headers.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
         assert_eq!(
-            rate_limit_retry_delay(&headers, 0),
+            generation_retry_delay(retry_after_delay(&headers), 0),
             std::time::Duration::from_secs(MAX_RETRY_DELAY_SECS)
         );
     }
 
     #[test]
-    fn rate_limit_retry_schedule_fits_within_ten_minute_timeout() {
-        let headers = reqwest::header::HeaderMap::new();
-        let total_delay: std::time::Duration = (0..MAX_RATE_LIMIT_RETRIES)
-            .map(|retry_count| rate_limit_retry_delay(&headers, retry_count))
-            .sum();
-
-        assert!(total_delay < std::time::Duration::from_secs(600));
-        assert!(total_delay >= std::time::Duration::from_secs(540));
+    fn backoff_is_exponential_and_remains_capped_indefinitely() {
+        for (count, seconds) in [
+            (0, 2),
+            (1, 4),
+            (2, 8),
+            (3, 16),
+            (4, 32),
+            (5, 60),
+            (usize::MAX, 60),
+        ] {
+            let delay = generation_retry_delay(None, count);
+            assert!(delay >= std::time::Duration::from_secs(seconds));
+            assert!(delay <= std::time::Duration::from_secs(seconds + 1));
+        }
     }
 
     #[tokio::test]
     async fn non_streaming_completion_recovers_after_extended_rate_limits() {
-        let (address, attempts) = spawn_rate_limited_responses_server(6).await;
+        let (address, attempts) = spawn_rate_limited_responses_server(30).await;
         let client = LlmClient::new(&format!("http://{address}/v1"), "test", "model");
 
         let output = client
@@ -624,12 +657,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.content, "recovered");
-        assert_eq!(attempts.load(Ordering::SeqCst), 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 31);
     }
 
     #[tokio::test]
     async fn streaming_completion_recovers_after_extended_rate_limits() {
-        let (address, attempts) = spawn_rate_limited_responses_server(6).await;
+        let (address, attempts) = spawn_rate_limited_responses_server(30).await;
         let client = LlmClient::new(&format!("http://{address}/v1"), "test", "model");
         let (tx, mut rx) = mpsc::channel(8);
 
@@ -638,7 +671,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 31);
         assert!(matches!(rx.recv().await, Some(StreamEvent::Delta(text)) if text == "recovered"));
         assert!(matches!(
             rx.recv().await,
@@ -654,11 +687,106 @@ mod tests {
         let client = LlmClient::new(&format!("http://{address}/v1"), "test", "model");
 
         let error = client
-            .complete(&[make_message(Role::User, "hello")], &[])
+            .complete_with_options(
+                &[make_message(Role::User, "hello")],
+                &[],
+                &LlmRequestOptions {
+                    max_rate_limit_retries: Some(2),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap_err();
 
         assert!(error.to_string().contains("429 Too Many Requests"));
-        assert_eq!(attempts.load(Ordering::SeqCst), MAX_RATE_LIMIT_RETRIES + 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn flex_retries_server_errors_but_returns_permanent_errors() {
+        for status in [
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::http::StatusCode::BAD_REQUEST,
+        ] {
+            let (address, attempts) = spawn_failing_responses_server(2, status, false).await;
+            let client = LlmClient::new(&format!("http://{address}/v1"), "test", "model");
+            let result = client
+                .complete(&[make_message(Role::User, "hello")], &[])
+                .await;
+            if status.is_server_error() || status == axum::http::StatusCode::REQUEST_TIMEOUT {
+                assert_eq!(result.unwrap().content, "recovered");
+                assert_eq!(attempts.load(Ordering::SeqCst), 3);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains(&status.as_u16().to_string())
+                );
+                assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_stream_is_reset_and_retried_without_an_error_event() {
+        let (address, attempts) =
+            spawn_failing_responses_server(1, axum::http::StatusCode::OK, true).await;
+        let client = LlmClient::new(&format!("http://{address}/v1"), "test", "model");
+        let (tx, mut rx) = mpsc::channel(8);
+        client
+            .complete_stream(&[make_message(Role::User, "hello")], &[], tx)
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Delta(text)) if text == "discard me"));
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Reset)));
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Delta(text)) if text == "recovered"));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamEvent::Completed { .. })
+        ));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn per_attempt_timeouts_retry_instead_of_ending_generation() {
+        use axum::response::IntoResponse;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route("/responses", axum::routing::post({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    axum::Json(json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": "recovered"}]}]})).into_response()
+                }
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = LlmClient::new(&format!("http://{address}"), "test", "model");
+        let output = client
+            .complete_with_options(
+                &[make_message(Role::User, "hello")],
+                &[],
+                &LlmRequestOptions {
+                    request_timeout: Some(std::time::Duration::from_millis(100)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content, "recovered");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 }

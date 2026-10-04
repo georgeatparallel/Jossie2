@@ -201,11 +201,15 @@ struct ResponsesResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct ResponseError {
     message: String,
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Delta(String),
+    /// Discard partial output from an attempt that is being retried.
+    Reset,
     Completed {
         tool_calls: Vec<ToolCall>,
         response_items: Vec<Value>,
@@ -254,8 +258,10 @@ pub struct ResponseOutputTokenDetails {
 
 #[derive(Debug, Clone, Default)]
 pub struct LlmRequestOptions {
-    /// Override the normal rate-limit retries; background work uses zero.
+    /// Override transient retries (unlimited for Flex); background work uses zero.
     pub max_rate_limit_retries: Option<usize>,
+    /// Timeout for each generation attempt, excluding backoff and later retries.
+    pub request_timeout: Option<std::time::Duration>,
     pub previous_response_id: Option<String>,
     pub prompt_cache_key: Option<String>,
     pub cache_breakpoint_message_index: Option<usize>,

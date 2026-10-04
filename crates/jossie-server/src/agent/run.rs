@@ -152,12 +152,13 @@ fn initial_llm_request_options(
     state: &AppState,
     prompt_cache_key: &str,
 ) -> jossie_llm::LlmRequestOptions {
-    if !state.agent.openai_optimizations {
-        return jossie_llm::LlmRequestOptions::default();
-    }
     jossie_llm::LlmRequestOptions {
-        prompt_cache_key: Some(prompt_cache_key.to_string()),
-        cache_breakpoint_message_index: Some(0),
+        request_timeout: Some(Duration::from_secs(state.agent.llm_request_timeout_seconds)),
+        prompt_cache_key: state
+            .agent
+            .openai_optimizations
+            .then(|| prompt_cache_key.to_string()),
+        cache_breakpoint_message_index: state.agent.openai_optimizations.then_some(0),
         ..jossie_llm::LlmRequestOptions::default()
     }
 }
@@ -177,21 +178,15 @@ async fn complete_agent_iteration(
         let chained_options = jossie_llm::LlmRequestOptions {
             previous_response_id: Some(previous_response_id.to_string()),
             structured_output: structured_output.cloned(),
-            ..jossie_llm::LlmRequestOptions::default()
+            ..initial_llm_request_options(state, prompt_cache_key)
         };
-        match tokio::time::timeout(
-            Duration::from_secs(state.agent.llm_request_timeout_seconds),
-            state
-                .llm
-                .complete_with_options(chained_messages, tools, &chained_options),
-        )
-        .await
+        match state
+            .llm
+            .complete_with_options(chained_messages, tools, &chained_options)
+            .await
         {
-            Ok(Ok(output)) => return Ok(output),
-            Err(_) => {
-                tracing::warn!("Responses continuation timed out; retrying from local context");
-            }
-            Ok(Err(error)) => {
+            Ok(output) => return Ok(output),
+            Err(error) => {
                 tracing::warn!(
                     "Responses continuation failed; retrying from local context: {error}"
                 );
@@ -203,19 +198,10 @@ async fn complete_agent_iteration(
     if state.agent.openai_optimizations {
         options.structured_output = structured_output.cloned();
     }
-    tokio::time::timeout(
-        Duration::from_secs(state.agent.llm_request_timeout_seconds),
-        state
-            .llm
-            .complete_with_options(full_messages, tools, &options),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "LLM request timed out after {} seconds",
-            state.agent.llm_request_timeout_seconds
-        )
-    })?
+    state
+        .llm
+        .complete_with_options(full_messages, tools, &options)
+        .await
 }
 
 enum AgentIterationOutcome {

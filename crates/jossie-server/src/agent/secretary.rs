@@ -53,12 +53,17 @@ pub async fn revise_secretary_draft(
             format!("Current draft:\n{current}\n\nOwner revision instruction:\n{instruction}"),
         ),
     ];
-    let response = tokio::time::timeout(
-        Duration::from_secs(state.agent.llm_request_timeout_seconds),
-        state.llm.complete(&messages, &[]),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Secretary revision timed out"))??;
+    let response = state
+        .llm
+        .complete_with_options(
+            &messages,
+            &[],
+            &jossie_llm::LlmRequestOptions {
+                request_timeout: Some(Duration::from_secs(state.agent.llm_request_timeout_seconds)),
+                ..Default::default()
+            },
+        )
+        .await?;
     let text = response.content.trim();
     anyhow::ensure!(!text.is_empty(), "Secretary produced an empty revision");
     let updated = state
@@ -152,22 +157,23 @@ async fn create_secretary_draft_inner(
 
     let mut output = None;
     for _ in 0..SECRETARY_MAX_ITERATIONS {
-        let response = tokio::time::timeout(
-            Duration::from_secs(state.agent.llm_request_timeout_seconds),
-            state.llm.complete_with_options(
+        let response = state
+            .llm
+            .complete_with_options(
                 &messages,
                 &tools,
                 &jossie_llm::LlmRequestOptions {
                     structured_output: Some(format.clone()),
-                    ..jossie_llm::LlmRequestOptions::default()
+                    request_timeout: Some(Duration::from_secs(
+                        state.agent.llm_request_timeout_seconds,
+                    )),
+                    ..Default::default()
                 },
-            ),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Secretary drafting timed out"))??;
+            )
+            .await?;
         if response.tool_calls.is_empty() {
-            output = Some(serde_json::from_str::<SecretaryDraftOutput>(&response.content).or_else(
-                |_| {
+            output = Some(
+                serde_json::from_str::<SecretaryDraftOutput>(&response.content).or_else(|_| {
                     let text = response.content.trim();
                     anyhow::ensure!(!text.is_empty(), "Secretary produced an empty draft");
                     Ok::<_, anyhow::Error>(SecretaryDraftOutput {
@@ -185,12 +191,16 @@ async fn create_secretary_draft_inner(
             .into_iter()
             .filter(|call| state.registry.metadata_for(call).effect == ToolEffect::Read)
             .collect::<Vec<_>>();
-        anyhow::ensure!(!safe_calls.is_empty(), "Secretary requested a non-read tool");
+        anyhow::ensure!(
+            !safe_calls.is_empty(),
+            "Secretary requested a non-read tool"
+        );
         messages.push(
             Message::transient(Role::Assistant, response.content)
                 .with_tool_calls(serde_json::to_value(&safe_calls)?),
         );
-        for (_, call, result) in execute_tool_batch(state, current.conversation_id, safe_calls).await
+        for (_, call, result) in
+            execute_tool_batch(state, current.conversation_id, safe_calls).await
         {
             messages.push(
                 Message::transient(Role::Tool, result.content)

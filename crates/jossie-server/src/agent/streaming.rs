@@ -118,7 +118,8 @@ async fn run_agent_loop_streaming_inner(
             return Ok(());
         }
         if iteration > 0
-            && run_started.elapsed() >= Duration::from_secs(state.agent.interactive_run_budget_seconds)
+            && run_started.elapsed()
+                >= Duration::from_secs(state.agent.interactive_run_budget_seconds)
         {
             if let Ok(partial) = pause_run_with_checkpoint(
                 state,
@@ -177,7 +178,7 @@ async fn run_agent_loop_streaming_inner(
                 chained_messages.clone(),
                 jossie_llm::LlmRequestOptions {
                     previous_response_id: Some(previous_response_id.clone()),
-                    ..jossie_llm::LlmRequestOptions::default()
+                    ..initial_llm_request_options(state, &prompt_cache_key)
                 },
             )
         } else {
@@ -210,8 +211,6 @@ async fn run_agent_loop_streaming_inner(
         let mut stream_error = None;
         let mut done_received = false;
         let mut completed_response_id = None;
-        let stream_deadline =
-            tokio::time::Instant::now() + Duration::from_secs(state.agent.llm_request_timeout_seconds);
 
         while !done_received {
             tokio::select! {
@@ -228,6 +227,14 @@ async fn run_agent_loop_streaming_inner(
                                     content: delta,
                                 },
                             ).await;
+                        }
+                        Some(jossie_llm::StreamEvent::Reset) => {
+                            full_content.clear();
+                            emit_stream_event(state, Some(&event_tx), ServerEvent::AssistantReset {
+                                conversation_id: conv_id,
+                                run_id: run_id.clone(),
+                                reason: "generation_retry".to_string(),
+                            }).await;
                         }
                         Some(jossie_llm::StreamEvent::Completed {
                             tool_calls: calls,
@@ -268,14 +275,7 @@ async fn run_agent_loop_streaming_inner(
                         return Ok(());
                     }
                 }
-                _ = tokio::time::sleep_until(stream_deadline) => {
-                    stream_task.abort();
-                    stream_error = Some(format!(
-                        "LLM stream timed out after {} seconds",
-                        state.agent.llm_request_timeout_seconds
-                    ));
-                    done_received = true;
-                }
+
             }
         }
 
@@ -287,11 +287,15 @@ async fn run_agent_loop_streaming_inner(
                     "Streaming Responses continuation failed; retrying from local context: {error}"
                 );
                 let request_options = initial_llm_request_options(state, &prompt_cache_key);
-                match state
-                    .llm
-                    .complete_with_options(&messages, &tools, &request_options)
-                    .await
-                {
+                let cancellation = state.run_cancellation(conv_id).await;
+                let fallback = tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        let _ = ensure_run_not_cancelled(state, conv_id, &run_id, Some(&event_tx)).await;
+                        return Ok(());
+                    }
+                    output = state.llm.complete_with_options(&messages, &tools, &request_options) => output,
+                };
+                match fallback {
                     Ok(output) => {
                         full_content = output.content;
                         tool_calls = output.tool_calls;

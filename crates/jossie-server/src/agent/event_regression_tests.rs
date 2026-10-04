@@ -175,6 +175,7 @@ async fn model_response(
         std::future::pending::<()>().await;
     }
     if model.rate_limit.load(Ordering::SeqCst) {
+        model.started.notify_one();
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             axum::Json(json!({"error": "rate limited"})),
@@ -409,4 +410,131 @@ async fn streaming_chat_preempts_a_blocked_background_llm_call() {
     }
     assert_eq!(completed, 1);
     server.abort();
+}
+
+#[tokio::test]
+async fn flex_chat_keeps_retrying_past_the_old_request_deadline() {
+    for streaming in [false, true] {
+        let model = Arc::new(Model::default());
+        model.rate_limit.store(true, Ordering::SeqCst);
+        let (url, server) = serve_model(model.clone()).await;
+        let mut state = state(&url, FakeMail::new("full")).await;
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .agent
+            .llm_request_timeout_seconds = 1;
+        let conversation = state.db.create_conversation(None).await.unwrap();
+        persist_message(
+            &state,
+            &Message::new(conversation.id, Role::User, "Hello".into()),
+        )
+        .await
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let run = tokio::spawn({
+            let state = state.clone();
+            async move {
+                if streaming {
+                    run_agent_loop_streaming(
+                        &state,
+                        conversation.id,
+                        Uuid::new_v4().to_string(),
+                        None,
+                        tx,
+                    )
+                    .await;
+                } else {
+                    assert_eq!(
+                        run_agent_loop_with_options(
+                            &state,
+                            conversation.id,
+                            AgentRunOptions::default()
+                        )
+                        .await
+                        .unwrap(),
+                        "Handled your question."
+                    );
+                }
+            }
+        });
+        model.started.notified().await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !run.is_finished(),
+            "Flex generation must survive the old deadline"
+        );
+        model.rate_limit.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        while let Some(event) = rx.recv().await {
+            assert!(!matches!(event, ServerEvent::Error { .. }));
+        }
+        let messages = state.db.get_messages(conversation.id, None).await.unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == Role::Assistant)
+                .count(),
+            1
+        );
+        assert!(model.requests.lock().unwrap().len() >= 2);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn flex_retry_backoff_remains_cancellable() {
+    for streaming in [false, true] {
+        let model = Arc::new(Model::default());
+        model.rate_limit.store(true, Ordering::SeqCst);
+        let (url, server) = serve_model(model.clone()).await;
+        let state = state(&url, FakeMail::new("full")).await;
+        let conversation = state.db.create_conversation(None).await.unwrap();
+        persist_message(
+            &state,
+            &Message::new(conversation.id, Role::User, "Hello".into()),
+        )
+        .await
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let run = tokio::spawn({
+            let state = state.clone();
+            async move {
+                if streaming {
+                    run_agent_loop_streaming(
+                        &state,
+                        conversation.id,
+                        Uuid::new_v4().to_string(),
+                        None,
+                        tx,
+                    )
+                    .await;
+                } else {
+                    assert!(
+                        run_agent_loop_with_options(
+                            &state,
+                            conversation.id,
+                            AgentRunOptions::default()
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            }
+        });
+        model.started.notified().await;
+        state.request_cancel(conversation.id).await;
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!state.active_conversations.is_active(conversation.id));
+        while let Some(event) = rx.recv().await {
+            assert!(!matches!(event, ServerEvent::Error { .. }));
+        }
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
 }
