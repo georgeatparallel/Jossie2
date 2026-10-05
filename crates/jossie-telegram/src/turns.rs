@@ -9,6 +9,9 @@ async fn process_turn(bot: Bot, state: Arc<AppState>, messages: Vec<teloxide::ty
     let _ = typing.send(());
     match result {
         Ok(TurnResult::Reply { text, keyboard }) => {
+            if text.trim().is_empty() && keyboard.is_none() {
+                return;
+            }
             if let Err(error) = send_reply(&bot, chat_id, Some(reply_to), &text, keyboard).await {
                 tracing::error!(
                     chat_id = chat_id.0,
@@ -229,7 +232,7 @@ fn with_conversational_goal_update(
     before: Option<&jossie_db::GoalWithTasks>,
     after: Option<&jossie_db::GoalWithTasks>,
 ) -> String {
-    if !goal_state_changed(before, after) {
+    if response.trim().is_empty() || !goal_state_changed(before, after) {
         return response;
     }
     let Some(after) = after else {

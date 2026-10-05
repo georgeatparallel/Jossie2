@@ -253,6 +253,13 @@ export function Chat({
         typeof payload.run === 'object'
       ) {
         const run = payload.run as WorkRun
+        if (
+          run.source_type === 'goal_continuation' &&
+          run.status === 'running'
+        ) {
+          setSending(false)
+          setActivity('Jossie is continuing in the background…')
+        }
         setActiveRuns((runs) =>
           ['queued', 'running', 'waiting_for_approval'].includes(run.status)
             ? [...runs.filter((item) => item.id !== run.id), run]
@@ -335,6 +342,7 @@ export function Chat({
           'run_waiting_for_approval',
           'run_completed',
           'run_paused',
+          'run_deferred',
           'run_cancelled',
           'error',
         ].includes(String(payload.type))
@@ -343,7 +351,9 @@ export function Chat({
         setActivity(
           payload.type === 'run_waiting_for_approval'
             ? 'Waiting for your approval'
-            : null,
+            : payload.type === 'run_deferred'
+              ? 'Jossie is continuing in the background…'
+              : null,
         )
         if (activeId) void refreshConversation(activeId)
         void loadThreads().catch((reason) =>
@@ -588,6 +598,7 @@ export function Chat({
             'run_waiting_for_approval',
             'run_completed',
             'run_paused',
+            'run_deferred',
             'run_cancelled',
             'error',
             'pending_action',

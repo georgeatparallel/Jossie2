@@ -566,7 +566,10 @@ async fn completion_model_response(
                 None
             };
             if attempt > 0 {
-                assert!(request.to_string().contains("ACTIVE GOAL CONTINUATION"));
+                assert!(
+                    request.to_string().contains("ACTIVE GOAL CONTINUATION")
+                        || request.to_string().contains("Resumed Work Checkpoint")
+                );
                 assert!(goal_id.is_some());
             }
             vec![json!({
@@ -676,4 +679,285 @@ async fn legacy_in_progress_plans_cannot_end_with_a_promise_in_either_chat_path(
         assert_eq!(model.attempts.load(Ordering::SeqCst), 8);
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn budget_limits_continue_work_asynchronously_without_a_pause_reply() {
+    for streaming in [false, true] {
+        for time_budget in [false, true] {
+            let model = Arc::new(CompletionModel::default());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn({
+                let model = model.clone();
+                async move {
+                    axum::serve(
+                        listener,
+                        axum::Router::new()
+                            .route("/responses", axum::routing::post(completion_model_response))
+                            .with_state(model),
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let mut state = state(&url, FakeMail::new("full")).await;
+            let config = &mut Arc::get_mut(&mut state).unwrap().agent;
+            config.max_agent_iterations = if time_budget { 10 } else { 2 };
+            config.interactive_run_budget_seconds = if time_budget { 0 } else { 600 };
+            let conv = state.db.create_conversation(None).await.unwrap();
+            persist_message(
+                &state,
+                &Message::new(
+                    conv.id,
+                    Role::User,
+                    "Extract all records and give the complete total".into(),
+                ),
+            )
+            .await
+            .unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+            if streaming {
+                run_agent_loop_streaming(&state, conv.id, Uuid::new_v4().to_string(), None, tx)
+                    .await;
+                let mut deferred = false;
+                while let Some(event) = rx.recv().await {
+                    assert!(!matches!(
+                        event,
+                        ServerEvent::RunPaused { .. }
+                            | ServerEvent::Error { .. }
+                            | ServerEvent::RunCompleted { .. }
+                    ));
+                    deferred |= matches!(event, ServerEvent::RunDeferred { .. });
+                }
+                assert!(deferred);
+            } else {
+                drop(tx);
+                assert!(run_agent_loop(&state, conv.id).await.unwrap().is_empty());
+            }
+            let goals = state.db.list_goals(false).await.unwrap();
+            assert_eq!(goals.len(), 1);
+            assert_eq!(goals[0].goal.status, "active");
+            assert_eq!(
+                state.db.list_queued_work_checkpoints().await.unwrap().len(),
+                1
+            );
+            for _ in 0..10 {
+                let workers = dispatch_work_continuations(&state).await.unwrap();
+                for worker in workers {
+                    worker.await.unwrap();
+                }
+                if state
+                    .db
+                    .list_queued_work_checkpoints()
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+            }
+            let goals = state.db.list_goals(false).await.unwrap();
+            assert_eq!(goals.len(), 1);
+            assert_eq!(goals[0].goal.status, "completed");
+            assert_eq!(goals[0].completed_tasks, 3);
+            assert_eq!(model.attempts.load(Ordering::SeqCst), 8);
+            let messages = state.db.get_messages(conv.id, None).await.unwrap();
+            let replies: Vec<_> = messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant && m.tool_calls.is_none())
+                .collect();
+            assert_eq!(replies.len(), 1);
+            assert_eq!(
+                replies[0].content,
+                "Every record was processed. The complete total is 600 EUR."
+            );
+            assert_eq!(messages.iter().filter(|m| m.role == Role::User).count(), 1);
+            assert!(!state.active_conversations.is_active(conv.id));
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn foreground_chat_preempts_a_continuation_without_losing_its_checkpoint() {
+    use jossie_db::{NewWorkRun, WorkRunStatus};
+    let model = Arc::new(Model::default());
+    model.rate_limit.store(true, Ordering::SeqCst);
+    let (url, server) = serve_model(model.clone()).await;
+    let state = state(&url, FakeMail::new("full")).await;
+    let conv = state.db.create_conversation(None).await.unwrap();
+    persist_message(
+        &state,
+        &Message::new(conv.id, Role::User, "Extract expenses".into()),
+    )
+    .await
+    .unwrap();
+    let goal = state
+        .db
+        .create_goal(
+            Some(conv.id),
+            "Expenses",
+            "Extract all expenses",
+            &["Read records".into()],
+        )
+        .await
+        .unwrap();
+    let run = state
+        .db
+        .create_work_run(NewWorkRun {
+            id: None,
+            goal_id: Some(&goal.goal.id),
+            task_id: None,
+            conversation_id: Some(conv.id),
+            kind: "chat",
+            source_type: None,
+            source_id: None,
+            summary: "Expenses",
+            visibility: "significant",
+        })
+        .await
+        .unwrap();
+    state
+        .db
+        .update_work_run(
+            &run.id,
+            WorkRunStatus::Queued,
+            Some("Continuing asynchronously"),
+            None,
+        )
+        .await
+        .unwrap();
+    state.db.save_work_run_checkpoint(&run.id, &goal.goal.id, None, conv.id,
+        &json!({"execution_options": {"authorization_context": "Extract expenses"}, "successful_reads": {"mail_read:receipt": "Amount 42 EUR"}}).to_string(), "").await.unwrap();
+    let mut workers = dispatch_work_continuations(&state).await.unwrap();
+    assert_eq!(workers.len(), 1);
+    model.started.notified().await;
+    assert!(
+        dispatch_work_continuations(&state)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    model.rate_limit.store(false, Ordering::SeqCst);
+    persist_message(&state, &Message::new(conv.id, Role::User, "Hello".into()))
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), run_agent_loop(&state, conv.id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply, "Handled your question.");
+    workers.pop().unwrap().await.unwrap();
+    let checkpoint = state
+        .db
+        .get_work_run_checkpoint(&run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.status, "available");
+    assert_eq!(
+        state
+            .db
+            .get_work_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "queued"
+    );
+    assert_eq!(
+        state
+            .db
+            .get_goal(&goal.goal.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "active"
+    );
+    let mut options: AgentRunOptions = serde_json::from_value(
+        serde_json::from_str::<Value>(&checkpoint.state_json).unwrap()["execution_options"].clone(),
+    )
+    .unwrap();
+    options.goal_id = Some(goal.goal.id.clone());
+    options.resume_checkpoint_run_id = Some(run.id.clone());
+    let (_, _, _, tracker, _, _) = prepare_run_context(&state, conv.id, &options)
+        .await
+        .unwrap();
+    assert_eq!(
+        tracker.successful_reads["mail_read:receipt"],
+        "Amount 42 EUR"
+    );
+    assert_eq!(tracker.primary_goal, "Extract all expenses");
+    assert_eq!(
+        options.authorization_context.as_deref(),
+        Some("Extract expenses")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn legacy_checkpoints_recover_full_verified_reads_before_history_projection() {
+    use jossie_db::NewWorkRun;
+    let state = state("http://127.0.0.1:1", FakeMail::new("full")).await;
+    let conv = state.db.create_conversation(None).await.unwrap();
+    let goal = state
+        .db
+        .create_goal(
+            Some(conv.id),
+            "Expenses",
+            "Read every expense",
+            &["Extract records".into()],
+        )
+        .await
+        .unwrap();
+    let call = jossie_core::ToolCall {
+        id: "read-1".into(),
+        name: "mail_read".into(),
+        arguments: "{}".into(),
+    };
+    let evidence = format!("{}Amount: 42 EUR", "receipt details ".repeat(100));
+    for message in [
+        Message::new(conv.id, Role::User, "Track expenses".into()),
+        Message::new(conv.id, Role::Assistant, String::new()).with_tool_calls(json!([call])),
+        Message::new(conv.id, Role::Tool, evidence.clone())
+            .with_tool_call_id(call.id.clone())
+            .with_name(call.name.clone()),
+        Message::new(conv.id, Role::Assistant, "Old automatic pause reply".into()),
+    ] {
+        persist_message(&state, &message).await.unwrap();
+    }
+    let run = state
+        .db
+        .create_work_run(NewWorkRun {
+            id: None,
+            goal_id: Some(&goal.goal.id),
+            task_id: None,
+            conversation_id: Some(conv.id),
+            kind: "chat",
+            source_type: None,
+            source_id: None,
+            summary: "Expenses",
+            visibility: "significant",
+        })
+        .await
+        .unwrap();
+    state.db.save_work_run_checkpoint(&run.id, &goal.goal.id, None, conv.id,
+        &json!({"recent_tool_records": [{"tool": call.name, "arguments": call.arguments, "status": "ok", "result": "truncated preview"}]}).to_string(), "").await.unwrap();
+    let (_, _, _, tracker, _, _) = prepare_run_context(
+        &state,
+        conv.id,
+        &AgentRunOptions {
+            goal_id: Some(goal.goal.id),
+            resume_checkpoint_run_id: Some(run.id),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tracker.successful_reads[&tool_call_signature(&call)],
+        evidence
+    );
 }

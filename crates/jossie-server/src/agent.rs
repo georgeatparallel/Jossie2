@@ -23,6 +23,7 @@ include!("agent/prompt_context.rs");
 include!("agent/secretary.rs");
 include!("agent/tools.rs");
 include!("agent/run.rs");
+include!("agent/continuations.rs");
 include!("agent/streaming.rs");
 include!("agent/reflection_knowledge.rs");
 include!("agent/event_outcome.rs");

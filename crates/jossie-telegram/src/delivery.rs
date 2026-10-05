@@ -32,11 +32,9 @@ async fn send_reply(
     text: &str,
     keyboard: Option<InlineKeyboardMarkup>,
 ) -> Result<(), teloxide::RequestError> {
-    let text = if text.trim().is_empty() {
-        "I couldn't produce a response. Please try again."
-    } else {
-        text
-    };
+    if text.trim().is_empty() {
+        return Ok(());
+    }
     let chunks = split_message(text, TELEGRAM_MESSAGE_LIMIT);
     for (index, chunk) in chunks.iter().enumerate() {
         let mut request = bot.send_message(chat_id, chunk.clone());

@@ -43,8 +43,10 @@ export function useConversationState(conversationId: string | null) {
         setPendingActions(actions)
         setActiveRuns(work.active_runs)
         setSending(
-          work.active_runs.some((run) =>
-            ['queued', 'running'].includes(run.status),
+          work.active_runs.some(
+            (run) =>
+              run.status === 'running' &&
+              run.source_type !== 'goal_continuation',
           ),
         )
         setLoadError(null)

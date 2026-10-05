@@ -131,6 +131,7 @@ export const changesWorkspaceSummary = (event: ServerEvent) =>
     'run_completed',
     'run_cancelled',
     'run_paused',
+    'run_deferred',
     'error',
   ].includes(event.type)
 
@@ -146,6 +147,7 @@ export const changesActivity = (event: ServerEvent) =>
     'run_waiting_for_approval',
     'run_completed',
     'run_paused',
+    'run_deferred',
     'run_cancelled',
     'background_notification',
     'error',

@@ -83,6 +83,12 @@ pub enum ServerEvent {
         conversation_id: Uuid,
         run_id: String,
     },
+    RunDeferred {
+        conversation_id: Uuid,
+        run_id: String,
+        goal_id: String,
+        reason: String,
+    },
     RunPaused {
         conversation_id: Uuid,
         run_id: String,
@@ -177,6 +183,9 @@ impl ServerEvent {
                 conversation_id, ..
             }
             | ServerEvent::RunCompleted {
+                conversation_id, ..
+            }
+            | ServerEvent::RunDeferred {
                 conversation_id, ..
             }
             | ServerEvent::RunPaused {
@@ -472,6 +481,25 @@ pub async fn persist_work_event(db: &jossie_db::Database, event: &ServerEvent) -
             } => {
                 db.update_work_run(run_id, WorkRunStatus::Completed, Some("Finished"), None)
                     .await?;
+                if let Some(run) = db.get_work_run(run_id).await? {
+                    derived.push(ServerEvent::WorkRunUpdated {
+                        conversation_id: Some(*conversation_id),
+                        run,
+                    });
+                }
+            }
+            ServerEvent::RunDeferred {
+                conversation_id,
+                run_id,
+                ..
+            } => {
+                db.update_work_run(
+                    run_id,
+                    WorkRunStatus::Queued,
+                    Some("Continuing asynchronously"),
+                    None,
+                )
+                .await?;
                 if let Some(run) = db.get_work_run(run_id).await? {
                     derived.push(ServerEvent::WorkRunUpdated {
                         conversation_id: Some(*conversation_id),

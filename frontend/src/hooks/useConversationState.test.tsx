@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { useConversationState } from './useConversationState'
 import { updateStream } from './streamMessages'
-import type { Message } from '../types'
+import type { Message, WorkRun } from '../types'
 import * as api from '../api'
 vi.mock('../api', () => ({
   getMessages: vi.fn(),
@@ -44,4 +44,26 @@ describe('conversation isolation', () => {
     messages = updateStream(messages, 'a', 'replacement')
     expect(messages.map((m) => m.content)).toEqual(['retained', 'replacement'])
   })
+})
+
+it('keeps chat available while automatic work is queued or running in the background', async () => {
+  vi.mocked(api.getMessages).mockResolvedValue([])
+  const { result } = renderHook(() => useConversationState('chat'))
+  for (const run of [
+    { id: 'queued', status: 'queued', source_type: 'chat_message' },
+    { id: 'background', status: 'running', source_type: 'goal_continuation' },
+    { id: 'foreground', status: 'running', source_type: 'chat_message' },
+  ]) {
+    vi.mocked(api.getWork).mockResolvedValue({
+      active_runs: [run as WorkRun],
+      goals: [],
+      recent_runs: [],
+      workers: [],
+      scheduled_tasks: [],
+      chat_imports: [],
+    })
+    await act(() => result.current.refreshConversation('chat'))
+    expect(result.current.activeRuns[0].id).toBe(run.id)
+    expect(result.current.sending).toBe(run.id === 'foreground')
+  }
 })

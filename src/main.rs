@@ -66,15 +66,15 @@ async fn main() -> Result<()> {
     if interrupted_runs > 0 {
         tracing::warn!("Marked {interrupted_runs} interrupted work run(s) after restart");
     }
-    let paused_goals = db.pause_goals_with_interrupted_runs().await?;
-    if paused_goals > 0 {
-        tracing::warn!("Paused {paused_goals} goal(s) whose active run was interrupted");
-    }
     let recovered_checkpoints = db.create_checkpoints_for_interrupted_runs().await?;
     if recovered_checkpoints > 0 {
         tracing::warn!(
             "Created {recovered_checkpoints} recovery checkpoint(s) for interrupted legacy runs"
         );
+    }
+    let queued_continuations = db.recover_automatic_work_continuations().await?;
+    if queued_continuations > 0 {
+        tracing::info!("Queued {queued_continuations} automatic work continuation(s)");
     }
     let interrupted_schedules = db.mark_running_scheduled_tasks_interrupted().await?;
     if interrupted_schedules > 0 {
@@ -279,6 +279,9 @@ async fn main() -> Result<()> {
     });
 
     tokio::spawn(run_work_watchdog(state.clone()));
+    tokio::spawn(jossie_server::agent::start_work_continuations(
+        state.clone(),
+    ));
 
     // Start Telegram bot if configured
     if !config.telegram.bot_token.is_empty() {
@@ -376,7 +379,7 @@ fn watchdog_should_stop(
 ) -> bool {
     // A conversation lease is live work, including intentional Flex backoff.
     // Approval waits are controlled by the user rather than an operation timeout.
-    if conversation_has_worker || status == "waiting_for_approval" {
+    if conversation_has_worker || matches!(status, "waiting_for_approval" | "queued") {
         return false;
     }
     chrono::DateTime::parse_from_rfc3339(updated_at).is_ok_and(|updated_at| {

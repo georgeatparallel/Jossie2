@@ -705,6 +705,73 @@ impl Database {
         .await?)
     }
 
+    /// Durable queue of automatic continuations. Explicitly paused/blocked goals
+    /// and requests needing an external-action decision must remain under user control.
+    pub async fn list_queued_work_checkpoints(&self) -> anyhow::Result<Vec<WorkRunCheckpoint>> {
+        Ok(sqlx::query_as::<_, WorkRunCheckpoint>(
+            "SELECT c.run_id, c.goal_id, c.task_id, c.conversation_id, c.state_json,
+                    c.partial_response, c.status, c.resumed_by_run_id, c.created_at, c.updated_at
+             FROM work_run_checkpoints c
+             JOIN work_runs r ON r.id = c.run_id
+             JOIN goals g ON g.id = c.goal_id
+             WHERE c.status = 'available' AND r.status = 'queued'
+               AND r.cancel_requested = 0 AND g.status IN ('active', 'completed', 'blocked')
+               AND julianday(c.updated_at) <= julianday('now')
+               AND NOT EXISTS (SELECT 1 FROM work_runs live
+                   WHERE live.goal_id = c.goal_id AND live.status IN ('running', 'waiting_for_approval'))
+               AND NOT EXISTS (SELECT 1 FROM pending_actions a
+                   WHERE a.conversation_id = c.conversation_id AND a.status IN ('pending', 'uncertain'))
+             ORDER BY r.updated_at LIMIT 20",
+        ).fetch_all(&self.pool).await?)
+    }
+
+    /// Recover automatic budget handoffs (including the old pause behavior) and
+    /// abandoned checkpoint claims. Explicit user pauses are left unchanged.
+    pub async fn recover_automatic_work_continuations(&self) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("UPDATE work_run_checkpoints SET status='available', resumed_by_run_id=NULL, updated_at=?
+            WHERE status='claimed' AND resumed_by_run_id IN
+                (SELECT id FROM work_runs WHERE status IN ('interrupted','cancelled','failed'))")
+            .bind(&now).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE goals SET status='active', blocker=NULL, updated_at=?
+            WHERE status='paused' AND blocker IN ('Interactive time budget reached',
+                'The agent repeatedly stopped while its tracked goal was still active',
+                'The agent repeated the same action without advancing its tracked goal')
+            AND id IN (SELECT goal_id FROM work_run_checkpoints WHERE status='available')",
+        )
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE goals SET status='active', blocker=NULL, updated_at=?
+            WHERE status='paused' AND blocker LIKE 'Agent iteration budget of % reached'
+            AND id IN (SELECT goal_id FROM work_run_checkpoints WHERE status='available')",
+        )
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        let changed = sqlx::query("UPDATE work_runs SET status='queued', current_phase='Continuing asynchronously', error=NULL, updated_at=?
+            WHERE status IN ('paused','interrupted') AND cancel_requested=0
+              AND id IN (SELECT c.run_id FROM work_run_checkpoints c JOIN goals g ON g.id=c.goal_id
+                         WHERE c.status='available' AND g.status='active')")
+            .bind(&now).execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    pub async fn defer_work_checkpoint_retry(&self, run_id: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE work_run_checkpoints SET updated_at=? WHERE run_id=? AND status='available'",
+        )
+        .bind((Utc::now() + chrono::Duration::seconds(30)).to_rfc3339())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn claim_work_run_checkpoint(
         &self,
         run_id: &str,
@@ -794,7 +861,7 @@ impl Database {
              FROM work_runs wr
              JOIN goals g ON g.id = wr.goal_id
              WHERE wr.status = 'interrupted'
-               AND g.status = 'paused'
+               AND g.status IN ('active', 'paused')
                AND wr.conversation_id IS NOT NULL
                AND NOT EXISTS (
                    SELECT 1 FROM work_runs newer

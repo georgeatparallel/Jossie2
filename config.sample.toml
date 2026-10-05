@@ -197,7 +197,8 @@ max_context_chars = 120000
 context_compact_target_chars = 80000
 context_keep_recent_dialogue_messages = 12
 
-# Interactive work pauses with a resumable checkpoint after this budget.
+# Interactive work continues asynchronously from a checkpoint after this budget.
+# Iteration limits also divide work into slices; neither limit pauses the goal.
 interactive_run_budget_seconds = 600
 # Bound individual model generation attempts and tool operations.
 # Timeout per model generation attempt. Flex retries temporary failures indefinitely

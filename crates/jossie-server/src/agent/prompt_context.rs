@@ -234,7 +234,8 @@ fn build_reflection_context(messages: &[Message]) -> String {
         .join("\n")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AgentRunOptions {
     pub allow_schedule_management: bool,
     pub allow_oob_messages: bool,

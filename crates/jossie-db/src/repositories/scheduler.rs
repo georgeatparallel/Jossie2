@@ -316,6 +316,19 @@ impl Database {
         Ok(id)
     }
 
+    /// Deliver an already persisted assistant result without duplicating the transcript.
+    pub async fn queue_continuation_result_delivery(
+        &self,
+        conversation_id: Uuid,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO out_of_band_messages (id, conversation_id, content, priority, created_at) VALUES (?, ?, ?, 'normal', ?)")
+            .bind(format!("continuation-result-{}", Uuid::new_v4()))
+            .bind(conversation_id.to_string()).bind(content).bind(Utc::now().to_rfc3339())
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn list_pending_oob_messages(
         &self,
         limit: usize,

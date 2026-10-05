@@ -158,7 +158,8 @@ async fn execute_scheduled_task(
             };
 
             // Send response via Telegram if configured
-            if !state.telegram.token.trim().is_empty()
+            if !response.trim().is_empty()
+                && !state.telegram.token.trim().is_empty()
                 && let Some(chat) = state.db.get_latest_telegram_chat().await?
                 && chat.conversation_id == conversation_id
             {
@@ -294,26 +295,28 @@ async fn process_oob_messages(state: &Arc<AppState>) -> anyhow::Result<()> {
             }
         }
 
-        let assistant_msg = Message {
-            id: Uuid::new_v4(),
-            conversation_id,
-            role: Role::Assistant,
-            content: msg.content.clone(),
-            attachments: None,
-            tool_calls: None,
-            tool_call_id: None,
-            name: Some("oob_message".to_string()),
-            response_items: None,
-            created_at: Utc::now(),
-        };
-        persist_message(state, &assistant_msg).await?;
-        state
-            .publish_event(ServerEvent::BackgroundNotification {
+        if !msg.id.starts_with("continuation-result-") {
+            let assistant_msg = Message {
+                id: Uuid::new_v4(),
                 conversation_id,
-                source: "oob_message".to_string(),
-                message: assistant_msg.content.clone(),
-            })
-            .await;
+                role: Role::Assistant,
+                content: msg.content.clone(),
+                attachments: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: Some("oob_message".to_string()),
+                response_items: None,
+                created_at: Utc::now(),
+            };
+            persist_message(state, &assistant_msg).await?;
+            state
+                .publish_event(ServerEvent::BackgroundNotification {
+                    conversation_id,
+                    source: "oob_message".to_string(),
+                    message: assistant_msg.content.clone(),
+                })
+                .await;
+        }
         state.db.mark_oob_message_sent(&msg.id).await?;
         state
             .db

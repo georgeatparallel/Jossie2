@@ -64,7 +64,7 @@ async fn run_agent_loop_streaming_inner(
     source_message_id: Option<Uuid>,
     event_tx: tokio::sync::mpsc::Sender<ServerEvent>,
 ) -> anyhow::Result<()> {
-    let options = AgentRunOptions::default();
+    let mut options = AgentRunOptions::default();
     let (
         mut toolset,
         mut messages,
@@ -104,6 +104,7 @@ async fn run_agent_loop_streaming_inner(
         tracing::warn!("Failed to associate chat run {run_id} with message: {error}");
     }
 
+    options.authorization_context = Some(last_user_msg.clone());
     let mut previous_response_id: Option<String> = None;
     let mut chained_messages = Vec::new();
     let run_started = std::time::Instant::now();
@@ -121,27 +122,16 @@ async fn run_agent_loop_streaming_inner(
             && run_started.elapsed()
                 >= Duration::from_secs(state.agent.interactive_run_budget_seconds)
         {
-            if let Ok(partial) = pause_run_with_checkpoint(
+            defer_run_with_checkpoint(
                 state,
                 conv_id,
                 &run_id,
                 &goal_tracker,
+                &options,
                 "Interactive time budget reached",
                 Some(&event_tx),
             )
-            .await
-            {
-                emit_stream_event(
-                    state,
-                    Some(&event_tx),
-                    ServerEvent::AssistantDelta {
-                        conversation_id: conv_id,
-                        run_id: run_id.clone(),
-                        content: partial,
-                    },
-                )
-                .await;
-            }
+            .await?;
             return Ok(());
         }
         if iteration > 0 {
@@ -361,6 +351,7 @@ async fn run_agent_loop_streaming_inner(
             &mut goal_tracker,
             &mut reflection_retries_remaining,
             &mut premature_goal_finals,
+            &options,
         )
         .await?
         {
@@ -378,16 +369,17 @@ async fn run_agent_loop_streaming_inner(
                 return Ok(());
             }
             AgentIterationOutcome::WaitingForApproval(_)
-            | AgentIterationOutcome::Paused(_)
+            | AgentIterationOutcome::Deferred(_)
             | AgentIterationOutcome::Cancelled => return Ok(()),
         }
     }
 
-    let partial = pause_run_with_checkpoint(
+    defer_run_with_checkpoint(
         state,
         conv_id,
         &run_id,
         &goal_tracker,
+        &options,
         &format!(
             "Agent iteration budget of {} reached",
             state.agent.max_agent_iterations
@@ -395,15 +387,5 @@ async fn run_agent_loop_streaming_inner(
         Some(&event_tx),
     )
     .await?;
-    emit_stream_event(
-        state,
-        Some(&event_tx),
-        ServerEvent::AssistantDelta {
-            conversation_id: conv_id,
-            run_id,
-            content: partial,
-        },
-    )
-    .await;
     Ok(())
 }
