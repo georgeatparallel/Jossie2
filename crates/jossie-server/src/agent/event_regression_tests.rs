@@ -538,3 +538,142 @@ async fn flex_retry_backoff_remains_cancellable() {
         server.abort();
     }
 }
+
+#[derive(Default)]
+struct CompletionModel {
+    attempts: AtomicUsize,
+}
+
+async fn completion_model_response(
+    axum::extract::State(model): axum::extract::State<Arc<CompletionModel>>,
+    axum::Json(request): axum::Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let attempt = model.attempts.fetch_add(1, Ordering::SeqCst);
+    let output = match attempt {
+        0 | 2 | 4 | 6 => {
+            let goal_id = if attempt > 0 {
+                request["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|item| item.get("content").and_then(Value::as_array))
+                    .flatten()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .find_map(|text| text.split("Tracked goal: id=").nth(1))
+                    .map(|text| text.split_whitespace().next().unwrap().to_string())
+            } else {
+                None
+            };
+            if attempt > 0 {
+                assert!(request.to_string().contains("ACTIVE GOAL CONTINUATION"));
+                assert!(goal_id.is_some());
+            }
+            vec![json!({
+                "type": "function_call", "id": format!("fc_{attempt}"), "call_id": format!("call_{attempt}"), "name": "update_work_plan",
+                "arguments": json!({"goal_id": goal_id, "title": "Full spending extraction", "objective": "Process every record and deliver the total",
+                    "goal_status": if attempt == 0 { "in_progress" } else if attempt == 6 { "completed" } else { "active" },
+                    "tasks": (0..3).map(|index| json!({"title": format!("Extract batch {index}"), "status": if index < attempt / 2 { "completed" } else { "pending" }, "summary": if index < attempt / 2 { "Batch processed" } else { "Not extracted yet" }})).collect::<Vec<_>>()
+                }).to_string()
+            })]
+        }
+        1 | 3 | 5 => vec![
+            json!({"type": "message", "content": [{"type": "output_text", "text": "I am doing it properly now. I'll finish the remaining records later."}]}),
+        ],
+        7 => vec![
+            json!({"type": "message", "content": [{"type": "output_text", "text": "Every record was processed. The complete total is 600 EUR."}]}),
+        ],
+        _ => panic!("Unexpected completion attempt {attempt}"),
+    };
+    if request["stream"] == true {
+        let mut events = String::new();
+        for (index, item) in output.iter().enumerate() {
+            if item["type"] == "message" {
+                events.push_str(&format!("data: {}\n\n", json!({"type": "response.output_text.delta", "delta": item["content"][0]["text"]})));
+            } else {
+                events.push_str(&format!("data: {}\n\n", json!({"type": "response.output_item.added", "output_index": index, "item": item})));
+            }
+            events.push_str(&format!(
+                "data: {}\n\n",
+                json!({"type": "response.output_item.done", "output_index": index, "item": item})
+            ));
+        }
+        events.push_str(&format!("data: {}\n\ndata: [DONE]\n\n", json!({"type": "response.completed", "response": {"id": format!("response_{attempt}"), "usage": {}}})));
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            events,
+        )
+            .into_response();
+    }
+    axum::Json(json!({"id": format!("response_{attempt}"), "output": output})).into_response()
+}
+
+#[tokio::test]
+async fn legacy_in_progress_plans_cannot_end_with_a_promise_in_either_chat_path() {
+    for streaming in [false, true] {
+        let model = Arc::new(CompletionModel::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn({
+            let model = model.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new()
+                        .route("/responses", axum::routing::post(completion_model_response))
+                        .with_state(model),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let mut state = state(&url, FakeMail::new("full")).await;
+        Arc::get_mut(&mut state).unwrap().agent.max_agent_iterations = 10;
+        let conversation = state.db.create_conversation(None).await.unwrap();
+        persist_message(
+            &state,
+            &Message::new(
+                conversation.id,
+                Role::User,
+                "Extract all records and give the complete total".into(),
+            ),
+        )
+        .await
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        if streaming {
+            run_agent_loop_streaming(
+                &state,
+                conversation.id,
+                Uuid::new_v4().to_string(),
+                None,
+                tx,
+            )
+            .await;
+            let mut reset = false;
+            while let Some(event) = rx.recv().await {
+                assert!(!matches!(event, ServerEvent::Error { .. }));
+                reset |= matches!(event, ServerEvent::AssistantReset { .. });
+            }
+            assert!(reset);
+        } else {
+            assert_eq!(
+                run_agent_loop(&state, conversation.id).await.unwrap(),
+                "Every record was processed. The complete total is 600 EUR."
+            );
+        }
+        let messages = state.db.get_messages(conversation.id, None).await.unwrap();
+        let replies = messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant && message.tool_calls.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(replies.len(), 1);
+        assert!(!replies[0].content.contains("later"));
+        let goals = state.db.list_goals(false).await.unwrap();
+        assert_eq!(goals.len(), 1);
+        assert_eq!(goals[0].goal.status, "completed");
+        assert_eq!(goals[0].completed_tasks, 3);
+        assert_eq!(model.attempts.load(Ordering::SeqCst), 8);
+        server.abort();
+    }
+}

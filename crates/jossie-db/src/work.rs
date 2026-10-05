@@ -6,6 +6,14 @@ use uuid::Uuid;
 mod models;
 pub use models::*;
 
+fn canonical_goal_status(status: &str) -> anyhow::Result<&str> {
+    match status {
+        "in_progress" => Ok("active"),
+        "active" | "blocked" | "paused" | "completed" | "cancelled" => Ok(status),
+        _ => anyhow::bail!("Unsupported goal status: {status}"),
+    }
+}
+
 impl Database {
     pub async fn create_goal(
         &self,
@@ -226,6 +234,15 @@ impl Database {
         blocker: Option<Option<&str>>,
         archive: Option<bool>,
     ) -> anyhow::Result<bool> {
+        let status = status.map(canonical_goal_status).transpose()?;
+        if status == Some("completed") {
+            let unfinished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM goal_tasks WHERE goal_id = ? AND status NOT IN ('completed','cancelled')")
+                .bind(id).fetch_one(&self.pool).await?;
+            anyhow::ensure!(
+                unfinished == 0,
+                "Cannot complete a goal with unfinished tasks"
+            );
+        }
         let now = Utc::now().to_rfc3339();
         let mut builder = QueryBuilder::<Sqlite>::new("UPDATE goals SET updated_at = ");
         builder.push_bind(&now);
@@ -331,6 +348,19 @@ impl Database {
         summary: Option<&str>,
         blocker: Option<&str>,
     ) -> anyhow::Result<GoalTask> {
+        anyhow::ensure!(
+            matches!(
+                status,
+                "pending"
+                    | "in_progress"
+                    | "waiting"
+                    | "blocked"
+                    | "completed"
+                    | "failed"
+                    | "cancelled"
+            ),
+            "Unsupported task status: {status}"
+        );
         let now = Utc::now().to_rfc3339();
         if let Some(id) = id
             && let Some(existing_goal_id) =

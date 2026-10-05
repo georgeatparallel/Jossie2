@@ -94,6 +94,12 @@ async fn main() -> Result<()> {
     }
     let db = Arc::new(db);
 
+    tracing::info!(
+        model = %config.llm.model,
+        reasoning_effort = ?config.llm.reasoning_effort,
+        service_tier = ?config.llm.service_tier,
+        "Using primary conversation model"
+    );
     let mut llm = LlmClient::new(&config.llm.api_url, &config.llm.api_key, &config.llm.model);
     llm.set_reasoning_effort(config.llm.reasoning_effort.clone());
     llm.set_reasoning_context(config.llm.reasoning_context.clone());
@@ -321,14 +327,18 @@ async fn run_work_watchdog(state: Arc<AppState>) {
         };
         let now = chrono::Utc::now();
         for run in runs {
-            let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&run.updated_at) else {
-                continue;
-            };
-            if now
-                .signed_duration_since(updated_at.with_timezone(&chrono::Utc))
-                .num_seconds()
-                <= stale_after as i64
-            {
+            let conversation_has_worker = run
+                .conversation_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .is_some_and(|id| state.active_conversations.is_active(id));
+            if !watchdog_should_stop(
+                &run.status,
+                conversation_has_worker,
+                &run.updated_at,
+                now,
+                stale_after,
+            ) {
                 continue;
             }
             tracing::error!(
@@ -354,5 +364,46 @@ async fn run_work_watchdog(state: Arc<AppState>) {
                 state.request_cancel(conversation_id).await;
             }
         }
+    }
+}
+
+fn watchdog_should_stop(
+    status: &str,
+    conversation_has_worker: bool,
+    updated_at: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    stale_after: u64,
+) -> bool {
+    // A conversation lease is live work, including intentional Flex backoff.
+    // Approval waits are controlled by the user rather than an operation timeout.
+    if conversation_has_worker || status == "waiting_for_approval" {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(updated_at).is_ok_and(|updated_at| {
+        now.signed_duration_since(updated_at.with_timezone(&chrono::Utc))
+            .num_seconds()
+            > stale_after as i64
+    })
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn live_flex_retries_and_user_approvals_survive_the_stale_deadline() {
+        let updated_at = "2026-10-05T00:00:00Z";
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-05T02:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!watchdog_should_stop("running", true, updated_at, now, 630));
+        assert!(!watchdog_should_stop(
+            "waiting_for_approval",
+            false,
+            updated_at,
+            now,
+            630
+        ));
+        assert!(watchdog_should_stop("running", false, updated_at, now, 630));
     }
 }

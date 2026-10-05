@@ -297,7 +297,10 @@ async fn build_system_prompt(
     prompt_memory_scope: PromptMemoryScope,
 ) -> PromptBundle {
     let stable = match prompt_memory_scope {
-        PromptMemoryScope::Chat => state.agent.system_prompt.clone(),
+        PromptMemoryScope::Chat => format!(
+            "{}\n\n{}",
+            state.agent.system_prompt, WORK_COMPLETION_PROMPT
+        ),
         PromptMemoryScope::Event => format!(
             "{}\n\n{}",
             state.agent.system_prompt, INCOMING_NOTIFICATION_MODE_PROMPT

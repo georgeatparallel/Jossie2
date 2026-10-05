@@ -14,7 +14,9 @@ mod tests {
         assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("emoji frequency"));
         assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("shortest natural continuation"));
         assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("genuinely ambiguous"));
-        assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("do not invent a confident interpretation"));
+        assert!(
+            SECRETARY_DRAFTING_MODE_PROMPT.contains("do not invent a confident interpretation")
+        );
     }
 
     #[test]
@@ -596,5 +598,71 @@ mod tests {
         let message_ref = message_ref_for_event(&event).unwrap();
         assert_eq!(message_ref.account_id, "gmail:account-1");
         assert_eq!(message_ref.external_id, "message-1");
+    }
+    #[test]
+    fn work_plan_status_schema_is_explicit_and_legacy_status_is_normalized() {
+        let schema = work_plan_tool().parameters;
+        let serialized = schema.to_string();
+        assert!(serialized.contains("active"));
+        assert!(serialized.contains("completed"));
+        let args: WorkPlanArgs = serde_json::from_value(serde_json::json!({
+            "title": "Extract all amounts", "objective": "Finish the full ledger", "goal_status": "in_progress",
+            "tasks": [{"title": "Extract amounts", "status": "in_progress"}]
+        })).unwrap();
+        assert_eq!(args.goal_status.as_str(), "active");
+        assert_eq!(args.tasks[0].status.as_str(), "in_progress");
+        assert!(serde_json::from_value::<WorkPlanArgs>(serde_json::json!({
+            "title": "Invalid", "objective": "Invalid", "goal_status": "almost_done", "tasks": []
+        })).is_err());
+    }
+
+    #[test]
+    fn substantial_unplanned_work_cannot_finish_with_a_partial_batch() {
+        let mut tracker = GoalTracker::new("Extract all the amounts");
+        for index in 0..2 {
+            let call = jossie_core::ToolCall {
+                id: format!("read-{index}"),
+                name: "mail_read".into(),
+                arguments: format!("{{\"id\":\"{index}\"}}"),
+            };
+            tracker.record_tool_result(
+                &call,
+                &jossie_core::ToolResult {
+                    tool_call_id: call.id.clone(),
+                    content: "Verified amount".into(),
+                    is_error: false,
+                },
+            );
+        }
+        assert!(
+            tracker
+                .active_goal_continuation_message()
+                .unwrap()
+                .contains("accounting for every requested outcome")
+        );
+        tracker.scheduled_execution = true;
+        assert!(tracker.active_goal_continuation_message().is_none());
+    }
+
+    #[test]
+    fn repeated_reads_retain_evidence_beyond_the_old_preview_limit() {
+        let mut tracker = GoalTracker::new("Extract amounts");
+        let call = jossie_core::ToolCall {
+            id: "read-1".into(),
+            name: "mail_read".into(),
+            arguments: "{}".into(),
+        };
+        let content = format!("{} Purchase amount: 124.99 EUR", "boilerplate ".repeat(80));
+        tracker.record_tool_result(
+            &call,
+            &jossie_core::ToolResult {
+                tool_call_id: call.id.clone(),
+                content,
+                is_error: false,
+            },
+        );
+        let (fresh, repeated) = tracker.split_repeated_reads(vec![call]);
+        assert!(fresh.is_empty());
+        assert!(repeated[0].2.content.contains("124.99 EUR"));
     }
 }

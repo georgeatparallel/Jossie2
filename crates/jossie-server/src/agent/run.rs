@@ -374,6 +374,10 @@ async fn process_agent_iteration_output(
     messages.push(assistant_message);
 
     let capability_message_start = messages.len();
+    let completed_outcomes_before = goal_tracker
+        .durable_goal
+        .as_ref()
+        .map_or(0, |goal| goal.completed_tasks);
     if process_work_plan_updates(
         state,
         conv_id,
@@ -396,6 +400,13 @@ async fn process_agent_iteration_output(
         )
         .await?
     {
+        if goal_tracker
+            .durable_goal
+            .as_ref()
+            .is_some_and(|goal| goal.completed_tasks > completed_outcomes_before)
+        {
+            *premature_goal_finals = 0;
+        }
         chained_messages.extend_from_slice(&messages[capability_message_start..]);
         return Ok(AgentIterationOutcome::Continue);
     }
@@ -513,7 +524,11 @@ async fn process_agent_iteration_output(
             },
         )
         .await;
+        let work_calls_before = goal_tracker.work_call_signatures.len();
         goal_tracker.record_tool_result(&call, &result);
+        if goal_tracker.work_call_signatures.len() > work_calls_before {
+            *premature_goal_finals = 0;
+        }
         let tool_message = Message::new(conv_id, Role::Tool, result.content)
             .with_tool_call_id(call.id)
             .with_name(call.name);
@@ -733,7 +748,11 @@ async fn pause_run_with_checkpoint(
     reason: &str,
     event_tx: Option<&tokio::sync::mpsc::Sender<ServerEvent>>,
 ) -> anyhow::Result<String> {
-    let goal = if let Some(goal) = goal_tracker.durable_goal.clone() {
+    let goal = if let Some(goal) = goal_tracker
+        .durable_goal
+        .clone()
+        .filter(|_| goal_tracker.goal_bound_to_run)
+    {
         goal
     } else {
         state

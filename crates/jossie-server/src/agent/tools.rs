@@ -279,7 +279,11 @@ async fn prepare_run_context(
         messages,
         last_user_msg.clone(),
         goal_tracker,
-        if state.agent.enable_self_reflection { 1 } else { 0 },
+        if state.agent.enable_self_reflection {
+            1
+        } else {
+            0
+        },
         prompt_cache_key,
     ))
 }
@@ -645,6 +649,24 @@ async fn process_work_plan_updates(
         if args.tasks.iter().any(|task| task.title.trim().is_empty()) {
             anyhow::bail!("Task titles cannot be empty");
         }
+        if args.goal_status == WorkPlanGoalStatus::Blocked
+            && args
+                .blocker
+                .as_deref()
+                .is_none_or(|blocker| blocker.trim().is_empty())
+        {
+            anyhow::bail!("A blocked goal needs a concrete blocker");
+        }
+        if args.goal_status == WorkPlanGoalStatus::Completed
+            && args.tasks.iter().any(|task| {
+                !matches!(
+                    task.status,
+                    WorkPlanTaskStatus::Completed | WorkPlanTaskStatus::Cancelled
+                )
+            })
+        {
+            anyhow::bail!("Complete every unfinished task before marking the goal completed");
+        }
         let requested_goal_id = effective_plan_goal_id(
             goal_tracker.locked_goal_id.as_deref(),
             args.goal_id.as_deref(),
@@ -658,33 +680,11 @@ async fn process_work_plan_updates(
             if existing.conversation_id.as_deref() != Some(&conv_id.to_string()) {
                 anyhow::bail!("Goal belongs to a different conversation");
             }
-            state
-                .db
-                .update_goal_metadata(
-                    goal_id,
-                    Some(args.title.trim()),
-                    Some(args.objective.trim()),
-                    Some(&args.goal_status),
-                    Some(args.blocker.as_deref()),
-                    None,
-                )
-                .await?;
             goal_id.to_string()
         } else {
             let goal = state
                 .db
                 .create_goal(Some(conv_id), args.title.trim(), args.objective.trim(), &[])
-                .await?;
-            state
-                .db
-                .update_goal_metadata(
-                    &goal.goal.id,
-                    None,
-                    None,
-                    Some(&args.goal_status),
-                    Some(args.blocker.as_deref()),
-                    None,
-                )
                 .await?;
             goal.goal.id
         };
@@ -700,12 +700,23 @@ async fn process_work_plan_updates(
                     requested_task_id,
                     position as i64,
                     task.title.trim(),
-                    &task.status,
+                    task.status.as_str(),
                     task.summary.as_deref(),
                     task.blocker.as_deref(),
                 )
                 .await?;
         }
+        state
+            .db
+            .update_goal_metadata(
+                &goal_id,
+                Some(args.title.trim()),
+                Some(args.objective.trim()),
+                Some(args.goal_status.as_str()),
+                Some(args.blocker.as_deref()),
+                None,
+            )
+            .await?;
         state
             .db
             .get_goal_with_tasks(&goal_id)
@@ -725,6 +736,7 @@ async fn process_work_plan_updates(
                 .db
                 .link_work_run_goal(run_id, &goal.goal.id, current_task_id)
                 .await?;
+            goal_tracker.primary_goal = goal.goal.objective.clone();
             goal_tracker.durable_goal = Some(goal.clone());
             goal_tracker.goal_bound_to_run = true;
             emit_stream_event(
@@ -1019,7 +1031,7 @@ struct WorkPlanTaskUpdate {
     #[serde(default)]
     id: Option<String>,
     title: String,
-    status: String,
+    status: WorkPlanTaskStatus,
     #[serde(default)]
     summary: Option<String>,
     #[serde(default)]
@@ -1033,8 +1045,57 @@ struct WorkPlanArgs {
     goal_id: Option<String>,
     title: String,
     objective: String,
-    goal_status: String,
+    goal_status: WorkPlanGoalStatus,
     #[serde(default)]
     blocker: Option<String>,
     tasks: Vec<WorkPlanTaskUpdate>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WorkPlanGoalStatus {
+    #[serde(alias = "in_progress")]
+    Active,
+    Blocked,
+    Paused,
+    Completed,
+    Cancelled,
+}
+
+impl WorkPlanGoalStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Blocked => "blocked",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WorkPlanTaskStatus {
+    Pending,
+    InProgress,
+    Waiting,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl WorkPlanTaskStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Waiting => "waiting",
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }

@@ -340,7 +340,9 @@ impl Database {
 
     // Messages
     pub async fn save_message(&self, msg: &Message) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        // Reserve the writer before reading conversation metadata. Upgrading a
+        // deferred read transaction can fail immediately under concurrent writes.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let id_str = msg.id.to_string();
         let conv_str = msg.conversation_id.to_string();

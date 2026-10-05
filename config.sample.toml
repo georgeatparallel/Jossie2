@@ -58,9 +58,9 @@ api_url = "https://api.openai.com/v1"
 api_key = "sk-your-openai-api-key-here"
 
 # Primary model to use for conversations
-# GPT-5.6 Sol is the flagship model for tool-heavy, proactive assistant workflows.
+# GPT-6.1 Sol supports reasoning and tool-heavy workflows through the Responses API.
 # For local models: Use whatever model name your API expects
-model = "gpt-5.6-sol"
+model = "gpt-6.1-sol"
 
 # Optional: Use a cheaper/faster model for background knowledge graph extraction
 # This can save API costs since KG extraction happens after every conversation turn

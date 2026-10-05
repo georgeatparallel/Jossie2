@@ -51,7 +51,10 @@ impl Database {
         url: &str,
         encryption_key: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let options = SqliteConnectOptions::from_str(url)?.foreign_keys(true);
+        let options = SqliteConnectOptions::from_str(url)?
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)

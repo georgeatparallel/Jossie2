@@ -174,6 +174,8 @@ async fn migrate_repairs_malformed_files_schema() {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(&format!("{original_name}.repair-backup-"))
+                && !entry.file_name().to_string_lossy().ends_with("-wal")
+                && !entry.file_name().to_string_lossy().ends_with("-shm")
         })
         .count();
     assert_eq!(backups, 1);
@@ -250,6 +252,8 @@ async fn migrate_versions_and_normalizes_legacy_schema() {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(&backup_prefix)
+                && !entry.file_name().to_string_lossy().ends_with("-wal")
+                && !entry.file_name().to_string_lossy().ends_with("-shm")
         })
         .collect::<Vec<_>>();
     assert_eq!(backups.len(), 1);
