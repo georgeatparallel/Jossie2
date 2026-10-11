@@ -187,39 +187,50 @@ fn extract_candidate_entities(message: &str) -> Vec<String> {
         }
     }
 
-    // NEW: Extract email addresses as entity candidates
-    if let Ok(email_regex) = Regex::new(r"\b([a-zA-Z0-9._-]+)@([a-zA-Z0-9._-]+\.[a-zA-Z]+)\b") {
-        for cap in email_regex.captures_iter(message) {
-            if let Some(email) = cap.get(0) {
-                let email_str = email.as_str().to_string();
-                let key = email_str.to_lowercase();
-                if seen.insert(key) {
-                    candidates.push(email_str);
-                }
+    // Patterns are immutable; compile them once across chat and extraction runs.
+    static EMAIL_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\b([a-zA-Z0-9._-]+)@([a-zA-Z0-9._-]+\.[a-zA-Z]+)\b")
+            .expect("valid email entity pattern")
+    });
+    static MENTION_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"@([A-Za-z0-9_]+)").expect("valid mention entity pattern")
+    });
+    static ROLE_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\b(?:my|our|the)\s+(boss|manager|colleague|friend|partner|coworker|supervisor|assistant|teammate)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b",
+        ).expect("valid role entity pattern")
+    });
 
-                // Also try to extract name from email (e.g., john.doe -> John Doe)
-                if let Some(username) = cap.get(1) {
-                    let name_parts: Vec<&str> = username.as_str().split(&['.', '_', '-']).collect();
-                    if name_parts.len() >= 2 {
-                        let formatted_name: String = name_parts
-                            .iter()
-                            .map(|part| {
-                                let mut chars = part.chars();
-                                match chars.next() {
-                                    None => String::new(),
-                                    Some(first) => {
-                                        first.to_uppercase().collect::<String>()
-                                            + &chars.as_str().to_lowercase()
-                                    }
+    for cap in EMAIL_REGEX.captures_iter(message) {
+        if let Some(email) = cap.get(0) {
+            let email_str = email.as_str().to_string();
+            let key = email_str.to_lowercase();
+            if seen.insert(key) {
+                candidates.push(email_str);
+            }
+
+            // Also try to extract name from email (e.g., john.doe -> John Doe)
+            if let Some(username) = cap.get(1) {
+                let name_parts: Vec<&str> = username.as_str().split(&['.', '_', '-']).collect();
+                if name_parts.len() >= 2 {
+                    let formatted_name: String = name_parts
+                        .iter()
+                        .map(|part| {
+                            let mut chars = part.chars();
+                            match chars.next() {
+                                None => String::new(),
+                                Some(first) => {
+                                    first.to_uppercase().collect::<String>()
+                                        + &chars.as_str().to_lowercase()
                                 }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ");
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
 
-                        let key = formatted_name.to_lowercase();
-                        if seen.insert(key) {
-                            candidates.push(formatted_name);
-                        }
+                    let key = formatted_name.to_lowercase();
+                    if seen.insert(key) {
+                        candidates.push(formatted_name);
                     }
                 }
             }
@@ -227,29 +238,23 @@ fn extract_candidate_entities(message: &str) -> Vec<String> {
     }
 
     // NEW: Extract @mentions (social media style)
-    if let Ok(mention_regex) = Regex::new(r"@([A-Za-z0-9_]+)") {
-        for cap in mention_regex.captures_iter(message) {
-            if let Some(mention) = cap.get(1) {
-                let mention_str = mention.as_str().to_string();
-                let key = mention_str.to_lowercase();
-                if seen.insert(key) {
-                    candidates.push(mention_str);
-                }
+    for cap in MENTION_REGEX.captures_iter(message) {
+        if let Some(mention) = cap.get(1) {
+            let mention_str = mention.as_str().to_string();
+            let key = mention_str.to_lowercase();
+            if seen.insert(key) {
+                candidates.push(mention_str);
             }
         }
     }
 
     // NEW: Extract role-based names (e.g., "my boss Alice", "colleague Bob")
-    if let Ok(role_regex) = Regex::new(
-        r"(?i)\b(?:my|our|the)\s+(boss|manager|colleague|friend|partner|coworker|supervisor|assistant|teammate)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b",
-    ) {
-        for cap in role_regex.captures_iter(message) {
-            if let Some(name) = cap.get(2) {
-                let name_str = name.as_str().to_string();
-                let key = name_str.to_lowercase();
-                if seen.insert(key) {
-                    candidates.push(name_str);
-                }
+    for cap in ROLE_REGEX.captures_iter(message) {
+        if let Some(name) = cap.get(2) {
+            let name_str = name.as_str().to_string();
+            let key = name_str.to_lowercase();
+            if seen.insert(key) {
+                candidates.push(name_str);
             }
         }
     }

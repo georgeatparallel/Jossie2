@@ -94,7 +94,7 @@ impl LlmClient {
     ) -> anyhow::Result<()> {
         let resp = self.send_responses_request(request, options).await?;
         let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = StreamLineBuffer::default();
         let mut pending_calls: HashMap<i32, PendingToolCall> = HashMap::new();
         let mut completed_items: HashMap<i32, Value> = HashMap::new();
         let mut done_received = false;
@@ -102,28 +102,26 @@ impl LlmClient {
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.push(&chunk);
 
-            while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].trim().to_string();
-                buffer = buffer[line_end + 1..].to_string();
-
-                if line.is_empty() || !line.starts_with("data: ") {
+            while let Some(line) = buffer.next_line() {
+                let Some(data) = line.trim_ascii().strip_prefix(b"data: ") else {
                     continue;
-                }
+                };
 
-                let data = &line[6..];
-                if data == "[DONE]" {
+                if data == b"[DONE]" {
                     done_received = true;
                     break;
                 }
 
-                let event: Value = serde_json::from_str(data).unwrap_or(Value::Null);
+                let Ok(event) = serde_json::from_slice::<Value>(data) else {
+                    continue;
+                };
                 if event["type"] == "response.output_text.delta" {
                     *emitted_output = true;
                 }
                 handle_stream_event(
-                    data,
+                    &event,
                     &mut pending_calls,
                     &mut completed_items,
                     &mut response_metadata,
@@ -159,6 +157,42 @@ impl LlmClient {
             })
             .await;
         Ok(())
+    }
+}
+
+/// Keep incomplete lines as bytes so network chunks can split UTF-8 characters.
+/// Scan each byte once and compact only when another chunk arrives, rather than
+/// allocating and copying the remaining response for every event line.
+#[derive(Default)]
+struct StreamLineBuffer {
+    bytes: Vec<u8>,
+    start: usize,
+    scanned: usize,
+}
+
+impl StreamLineBuffer {
+    fn push(&mut self, chunk: &[u8]) {
+        if self.start > 0 {
+            self.bytes.drain(..self.start);
+            self.scanned -= self.start;
+            self.start = 0;
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    fn next_line(&mut self) -> Option<&[u8]> {
+        let Some(offset) = self.bytes[self.scanned..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        else {
+            self.scanned = self.bytes.len();
+            return None;
+        };
+        let end = self.scanned + offset;
+        let start = self.start;
+        self.start = end + 1;
+        self.scanned = self.start;
+        Some(&self.bytes[start..end])
     }
 }
 
@@ -252,16 +286,12 @@ struct StreamResponseMetadata {
 }
 
 async fn handle_stream_event(
-    data: &str,
+    value: &Value,
     pending_calls: &mut HashMap<i32, PendingToolCall>,
     completed_items: &mut HashMap<i32, Value>,
     response_metadata: &mut StreamResponseMetadata,
     tx: &mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
-    let Ok(value) = serde_json::from_str::<Value>(data) else {
-        return Ok(());
-    };
-
     let Some(event_type) = value.get("type").and_then(Value::as_str) else {
         return Ok(());
     };
@@ -353,7 +383,7 @@ async fn handle_stream_event(
                 .get("response")
                 .and_then(|response| response.get("error"))
                 .or_else(|| value.get("error"))
-                .unwrap_or(&value);
+                .unwrap_or(value);
             let message = error
                 .get("message")
                 .and_then(Value::as_str)

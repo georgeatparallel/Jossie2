@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_request_uses_previous_response_id_without_cache_write() {
+    fn continuation_request_without_explicit_cache_options_uses_provider_default() {
         let client = LlmClient::new("https://api.openai.com/v1", "test-key", "gpt-5.6-sol");
         let options = LlmRequestOptions {
             previous_response_id: Some("resp_previous".to_string()),
@@ -462,6 +462,42 @@ mod tests {
         assert_eq!(json["previous_response_id"], "resp_previous");
         assert_eq!(json["store"], true);
         assert!(json.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn continuation_does_not_reuse_full_prompt_breakpoint_index() {
+        let client = test_client();
+        for stream in [false, true] {
+            for messages in [
+                vec![make_message(Role::Tool, "result").with_tool_call_id("call_1".into())],
+                vec![make_message(Role::System, "Updated goal progress")],
+            ] {
+                let options = LlmRequestOptions {
+                    previous_response_id: Some("resp_previous".into()),
+                    prompt_cache_key: Some("jossie:chat:abc".into()),
+                    cache_breakpoint_message_index: Some(0),
+                    ..Default::default()
+                };
+                let request =
+                    serde_json::to_value(client.build_request(&messages, &[], stream, &options))
+                        .unwrap();
+                let default_request = serde_json::to_value(client.build_request(
+                    &messages,
+                    &[],
+                    stream,
+                    &LlmRequestOptions {
+                        cache_breakpoint_message_index: None,
+                        ..options
+                    },
+                ))
+                .unwrap();
+
+                assert_eq!(request["previous_response_id"], "resp_previous");
+                assert_eq!(request["prompt_cache_key"], "jossie:chat:abc");
+                assert_eq!(request["prompt_cache_options"]["mode"], "implicit");
+                assert_eq!(request["input"], default_request["input"]);
+            }
+        }
     }
 
     #[test]
@@ -537,6 +573,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fragmented_stream_preserves_unicode_text_and_tool_arguments() {
+        let delta = json!({"type": "response.output_text.delta", "delta": "Hello café 🌍 東京"});
+        let call = json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": ""}
+        });
+        let arguments = json!({
+            "type": "response.function_call_arguments.delta", "output_index": 0,
+            "delta": "{\"query\":\"café 🌍 東京\"}"
+        });
+        let completed = json!({"type": "response.completed", "response": {"id": "resp_unicode"}});
+        let wire = format!(
+            ": comment\r\ndata: {delta}\r\n\r\ndata: {call}\n\ndata: {arguments}\n\ndata: {completed}\n\ndata: [DONE]\n\n"
+        );
+
+        // Exercise every possible two-chunk split, including inside UTF-8,
+        // JSON strings, CRLF, and the data prefix, plus byte-at-a-time input.
+        for split in 0..=wire.len() + 1 {
+            let chunks = if split <= wire.len() {
+                vec![&wire.as_bytes()[..split], &wire.as_bytes()[split..]]
+            } else {
+                wire.as_bytes().chunks(1).collect()
+            };
+            let mut buffer = StreamLineBuffer::default();
+            let (tx, mut rx) = mpsc::channel(4);
+            let mut pending_calls = HashMap::new();
+            let mut completed_items = HashMap::new();
+            let mut metadata = StreamResponseMetadata::default();
+            for chunk in chunks {
+                buffer.push(chunk);
+                while let Some(line) = buffer.next_line() {
+                    let Some(data) = line.trim_ascii().strip_prefix(b"data: ") else {
+                        continue;
+                    };
+                    if data == b"[DONE]" {
+                        continue;
+                    }
+                    let value = serde_json::from_slice(data).unwrap();
+                    handle_stream_event(
+                        &value,
+                        &mut pending_calls,
+                        &mut completed_items,
+                        &mut metadata,
+                        &tx,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            assert!(
+                matches!(rx.try_recv().unwrap(), StreamEvent::Delta(text) if text == "Hello café 🌍 東京")
+            );
+            assert!(rx.try_recv().is_err());
+            let calls = collect_tool_calls(pending_calls);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "lookup");
+            assert_eq!(calls[0].arguments, "{\"query\":\"café 🌍 東京\"}");
+            assert!(metadata.completed);
+            assert_eq!(metadata.response_id.as_deref(), Some("resp_unicode"));
+        }
+    }
+
+    #[tokio::test]
     async fn stream_events_preserve_completed_items_in_output_order() {
         let (tx, _rx) = mpsc::channel(1);
         let mut pending_calls = HashMap::new();
@@ -550,8 +649,7 @@ mod tests {
                 "type": "response.output_item.done",
                 "output_index": 1,
                 "item": second
-            })
-            .to_string(),
+            }),
             &mut pending_calls,
             &mut completed_items,
             &mut response_metadata,
@@ -564,8 +662,7 @@ mod tests {
                 "type": "response.output_item.done",
                 "output_index": 0,
                 "item": first
-            })
-            .to_string(),
+            }),
             &mut pending_calls,
             &mut completed_items,
             &mut response_metadata,
@@ -586,8 +683,7 @@ mod tests {
                         "total_tokens": 25
                     }
                 }
-            })
-            .to_string(),
+            }),
             &mut pending_calls,
             &mut completed_items,
             &mut response_metadata,

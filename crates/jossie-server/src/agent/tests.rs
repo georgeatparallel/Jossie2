@@ -8,6 +8,34 @@ mod tests {
     }
 
     #[test]
+    fn entity_extraction_preserves_names_addresses_mentions_and_deduplication() {
+        let message = "ask my boss Alice; email john.doe@example.com; mention @robin; discuss \"Project Aurora\" with Alice";
+        let first = extract_candidate_entities(message);
+        for expected in [
+            "Alice",
+            "john.doe@example.com",
+            "John Doe",
+            "robin",
+            "Project Aurora",
+        ] {
+            assert!(
+                first.iter().any(|candidate| candidate == expected),
+                "missing {expected}: {first:?}"
+            );
+        }
+        assert_eq!(
+            first
+                .iter()
+                .filter(|candidate| *candidate == "Alice")
+                .count(),
+            1
+        );
+        // Repeated calls share compiled patterns but retain no matches or state.
+        assert!(extract_candidate_entities("no entities here").is_empty());
+        assert_eq!(extract_candidate_entities(message), first);
+    }
+
+    #[test]
     fn secretary_prompt_matches_the_owners_chat_voice() {
         assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("Write as the owner"));
         assert!(SECRETARY_DRAFTING_MODE_PROMPT.contains("spelling"));

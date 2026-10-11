@@ -120,10 +120,16 @@ impl LlmClient {
     ) -> ResponsesRequest {
         let built_tools = self.build_tools(tools);
         let has_tools = built_tools.is_some();
+        // A continuation contains only new items; an index into the full
+        // prompt no longer identifies the stable system prefix. Let implicit
+        // caching reuse the growing conversation, including tool results.
+        let cache_breakpoint_message_index = options
+            .cache_breakpoint_message_index
+            .filter(|_| options.previous_response_id.is_none());
 
         ResponsesRequest {
             model: self.model.clone(),
-            input: self.build_input(messages, options.cache_breakpoint_message_index),
+            input: self.build_input(messages, cache_breakpoint_message_index),
             tools: built_tools,
             tool_choice: if has_tools {
                 Some(Value::String("auto".to_string()))
@@ -142,9 +148,15 @@ impl LlmClient {
             service_tier: self.service_tier.clone(),
             previous_response_id: options.previous_response_id.clone(),
             prompt_cache_key: options.prompt_cache_key.clone(),
-            prompt_cache_options: options
-                .cache_breakpoint_message_index
-                .map(|_| PromptCacheOptions { mode: "explicit" }),
+            prompt_cache_options: options.cache_breakpoint_message_index.map(|_| {
+                PromptCacheOptions {
+                    mode: if options.previous_response_id.is_some() {
+                        "implicit"
+                    } else {
+                        "explicit"
+                    },
+                }
+            }),
             store: options.previous_response_id.as_ref().map(|_| true),
             text: options
                 .structured_output
@@ -159,5 +171,4 @@ impl LlmClient {
                 }),
         }
     }
-
 }

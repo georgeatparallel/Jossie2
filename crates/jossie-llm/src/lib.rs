@@ -264,6 +264,8 @@ pub struct LlmRequestOptions {
     pub request_timeout: Option<std::time::Duration>,
     pub previous_response_id: Option<String>,
     pub prompt_cache_key: Option<String>,
+    /// Stable prefix boundary for full-context requests. Continuations use
+    /// implicit caching instead, since their input contains only new items.
     pub cache_breakpoint_message_index: Option<usize>,
     pub structured_output: Option<StructuredOutputFormat>,
 }
