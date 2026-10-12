@@ -188,7 +188,7 @@ mod tests {
     async fn recovery_retries_evaluations_but_never_uncertain_delivery_or_history() {
         let (db, id) = fixture().await;
         db.mark_integration_event_processing(&id).await.unwrap();
-        db.begin_integration_event_delivery(&[id.clone()])
+        db.begin_integration_event_delivery(std::slice::from_ref(&id))
             .await
             .unwrap();
         db.recover_interrupted_event_evaluations(&(Utc::now() + Duration::seconds(1)).to_rfc3339())
@@ -264,11 +264,11 @@ mod tests {
     async fn definite_delivery_failure_can_retry_and_success_resolves_diagnostics() {
         let (db, id) = fixture().await;
         db.mark_integration_event_processing(&id).await.unwrap();
-        db.begin_integration_event_delivery(&[id.clone()])
+        db.begin_integration_event_delivery(std::slice::from_ref(&id))
             .await
             .unwrap();
         // Telegram explicitly rejected the request, so there was no send.
-        db.clear_integration_event_delivery(&[id.clone()])
+        db.clear_integration_event_delivery(std::slice::from_ref(&id))
             .await
             .unwrap();
         db.retry_integration_event(&id, "Telegram rate limited notification")
@@ -286,7 +286,7 @@ mod tests {
             .await
             .unwrap();
         assert!(db.mark_integration_event_processing(&id).await.unwrap());
-        db.begin_integration_event_delivery(&[id.clone()])
+        db.begin_integration_event_delivery(std::slice::from_ref(&id))
             .await
             .unwrap();
         // Both Telegram and local persistence succeeded.

@@ -24,19 +24,12 @@ impl HttpIntegration {
             anyhow::anyhow!("Invalid URL: {}", e)
         })?;
 
-        validate_url_target(&url).await?;
-        tracing::debug!("URL passed SSRF validation: {}", url);
-
         let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| {
             tracing::error!("Invalid HTTP method: {}", method);
             anyhow::anyhow!("Invalid HTTP method")
         })?;
 
-        // 1. Prepare Client
-        // We handle redirects manually for security if needed, but the requirements say:
-        // "Must request headers, especially Authorization... Default follow_redirects=false."
-        // "If redirects enabled, carry headers only when redirect stays on same origin"
-
+        // Validate every redirect ourselves before sending a request.
         let client_builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(
                 timeout_ms.unwrap_or(20000),
@@ -48,21 +41,18 @@ impl HttpIntegration {
         // Loops for redirect handling
         let mut current_url = url.clone();
         let mut current_method = method.clone();
-        let mut attempts = 0;
-        let max_attempts = if follow_redirects { 10 } else { 1 };
+        let mut redirects = 0;
+        const MAX_REDIRECTS: usize = 10;
 
         // Prepare initial headers
         let mut final_headers = HeaderMap::new();
         if let Some(h_map) = headers {
             for (k, v) in h_map {
-                if let (Ok(hn), Ok(hv)) = (
-                    HeaderName::from_bytes(k.as_bytes()),
-                    HeaderValue::from_str(&v),
-                ) {
-                    final_headers.insert(hn, hv);
-                } else {
-                    tracing::warn!("Failed to parse header: {} = {}", k, v);
-                }
+                let name = HeaderName::from_bytes(k.as_bytes())
+                    .map_err(|_| anyhow::anyhow!("Invalid HTTP header name"))?;
+                let value = HeaderValue::from_str(&v)
+                    .map_err(|_| anyhow::anyhow!("Invalid value for HTTP header '{name}'"))?;
+                final_headers.insert(name, value);
             }
         }
 
@@ -78,9 +68,6 @@ impl HttpIntegration {
 
         // Apply query params to initial URL
         if let Some(q) = query {
-            // We can't easily append to existing query without parsing, so we use pairs
-            // But existing pairs might exist.
-            // Let's use url's query_pairs_mut
             {
                 let mut pairs = current_url.query_pairs_mut();
                 for (k, v) in q {
@@ -128,45 +115,47 @@ impl HttpIntegration {
 
         // Redirect loop
         loop {
+            validate_url_target(&current_url).await?;
+
             // SECURITY CHECK: Domain Allowlist for Secrets
             // If we have Authorization header, check if domain is allowed.
             if final_headers.contains_key(reqwest::header::AUTHORIZATION)
                 && let Some(host) = current_url.host_str()
             {
-                    let host_lower = host.to_lowercase();
-                    // If allowlist is empty, we allow everything (per user request).
-                    // If allowlist is NOT empty, we check if domain is in it or if "*" is present.
-                    let mut allowed = self.allowed_domains.is_empty();
+                let host_lower = host.to_lowercase();
+                // If allowlist is empty, we allow everything (per user request).
+                // If allowlist is NOT empty, we check if domain is in it or if "*" is present.
+                let mut allowed = self.allowed_domains.is_empty();
 
-                    if !allowed {
-                        for allowed_domain in &self.allowed_domains {
-                            if allowed_domain == "*" {
-                                allowed = true;
-                                break;
-                            }
-                            if host_lower == *allowed_domain
-                                || host_lower.ends_with(&format!(".{}", allowed_domain))
-                            {
-                                allowed = true;
-                                break;
-                            }
+                if !allowed {
+                    for allowed_domain in &self.allowed_domains {
+                        if allowed_domain == "*" {
+                            allowed = true;
+                            break;
+                        }
+                        if host_lower == *allowed_domain
+                            || host_lower.ends_with(&format!(".{}", allowed_domain))
+                        {
+                            allowed = true;
+                            break;
                         }
                     }
+                }
 
-                    if !allowed {
-                        // Strip or Block?
-                        // "Any attempt to send secrets to non-allowlisted domains must be blocked"
-                        tracing::warn!(
-                            "Blocked: Authentication header present but domain '{}' is not in allowed_domains list",
-                            host
-                        );
-                        return Err(anyhow::anyhow!(
-                            "Authentication header present but domain '{}' is not in allowed_domains list.",
-                            host
-                        ));
-                    } else {
-                        tracing::debug!("Domain '{}' is in allowed_domains list for auth", host);
-                    }
+                if !allowed {
+                    // Strip or Block?
+                    // "Any attempt to send secrets to non-allowlisted domains must be blocked"
+                    tracing::warn!(
+                        "Blocked: Authentication header present but domain '{}' is not in allowed_domains list",
+                        host
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Authentication header present but domain '{}' is not in allowed_domains list.",
+                        host
+                    ));
+                } else {
+                    tracing::debug!("Domain '{}' is in allowed_domains list for auth", host);
+                }
             }
 
             // Log complete request details
@@ -178,6 +167,7 @@ impl HttpIntegration {
                 current_multipart.is_some(),
             );
 
+            let sent_multipart = current_multipart.is_some();
             let mut req_builder = client
                 .request(current_method.clone(), current_url.clone())
                 .headers(final_headers.clone());
@@ -206,71 +196,42 @@ impl HttpIntegration {
                 current_url
             );
 
-            // Check if redirect
-            if status.is_redirection()
-                && follow_redirects
-                && attempts < max_attempts
-                && let Some(location) = resp.headers().get("Location")
-                && let Ok(loc_str) = location.to_str()
+            if follow_redirects
+                && let Some(next_method) = redirect_method(status, &current_method)
+                && let Some(location) = resp.headers().get(reqwest::header::LOCATION)
             {
-                        let next_url = match Url::parse(loc_str) {
-                            Ok(u) => u,
-                            Err(url::ParseError::RelativeUrlWithoutBase) => {
-                                // Handle relative
-                                current_url.join(loc_str)?
-                            }
-                            Err(e) => {
-                                return Err(anyhow::anyhow!("Invalid redirect location: {}", e));
-                            }
-                        };
+                if redirects >= MAX_REDIRECTS {
+                    anyhow::bail!("HTTP redirect limit exceeded ({MAX_REDIRECTS})");
+                }
+                let location = location
+                    .to_str()
+                    .map_err(|_| anyhow::anyhow!("Invalid redirect location header"))?;
+                let next_url = current_url
+                    .join(location)
+                    .map_err(|e| anyhow::anyhow!("Invalid redirect location: {e}"))?;
+                let drop_body =
+                    next_method != current_method || status == reqwest::StatusCode::SEE_OTHER;
+                if !drop_body && sent_multipart {
+                    anyhow::bail!("Cannot replay a multipart body after an HTTP redirect");
+                }
 
-                        // Check Cross-Origin
-                        let same_origin = next_url.origin() == current_url.origin();
-
-                        if !same_origin {
-                            // STRIP Authorization
-                            tracing::warn!(
-                                "Redirecting cross-origin from {} to {}. Stripping sensitive headers.",
-                                current_url,
-                                next_url
-                            );
-                            let had_auth =
-                                final_headers.contains_key(reqwest::header::AUTHORIZATION);
-                            let had_cookie = final_headers.contains_key(reqwest::header::COOKIE);
-                            final_headers.remove(reqwest::header::AUTHORIZATION);
-                            final_headers.remove(reqwest::header::COOKIE);
-                            if had_auth {
-                                tracing::warn!(
-                                    "Stripped Authorization header due to cross-origin redirect"
-                                );
-                            }
-                            if had_cookie {
-                                tracing::warn!(
-                                    "Stripped Cookie header due to cross-origin redirect"
-                                );
-                            }
-                        } else {
-                            tracing::debug!(
-                                "Redirecting same-origin from {} to {}. Preserving headers.",
-                                current_url,
-                                next_url
-                            );
-                        }
-
-                        current_url = next_url;
-                        attempts += 1;
-                        // Redirects usually change to GET unless 307/308
-                        if status != 307 && status != 308 {
-                            tracing::debug!(
-                                "Redirect {} changes method to GET, dropping body",
-                                status
-                            );
-                            current_method = reqwest::Method::GET;
-                            current_body_bytes = None;
-                            current_multipart = None; // Body is dropped on redirect to GET
-                        } else {
-                            tracing::debug!("Redirect {} preserves method and body", status);
-                        }
+                if next_url.origin() != current_url.origin() {
+                    final_headers.remove(reqwest::header::AUTHORIZATION);
+                    final_headers.remove(reqwest::header::COOKIE);
+                    final_headers.remove(reqwest::header::PROXY_AUTHORIZATION);
+                    final_headers.remove(reqwest::header::HOST);
+                }
+                if drop_body {
+                    current_body_bytes = None;
+                    current_multipart = None;
+                    final_headers.remove(reqwest::header::CONTENT_TYPE);
+                    final_headers.remove(reqwest::header::CONTENT_LENGTH);
+                    final_headers.remove(reqwest::header::TRANSFER_ENCODING);
+                    final_headers.remove(reqwest::header::CONTENT_ENCODING);
+                }
+                current_url = next_url;
+                current_method = next_method;
+                redirects += 1;
                 continue;
             }
 
@@ -283,12 +244,10 @@ impl HttpIntegration {
             tracing::debug!("Response headers count: {}", res_headers.len());
 
             // Log authentication-related response headers
-            if res_headers.contains_key("www-authenticate") {
+            if let Some(challenge) = res_headers.get("www-authenticate") {
                 tracing::warn!(
                     "Response includes WWW-Authenticate header (auth challenge): {}",
-                    res_headers
-                        .get("www-authenticate")
-                        .unwrap_or(&"unknown".to_string())
+                    challenge
                 );
             }
             if status == 401 {
@@ -332,15 +291,14 @@ impl HttpIntegration {
                 body_json: Option<Value>,
             }
 
+            self.log_response_details(status, &res_headers, &body_text);
+
             let output = Output {
                 status: status.as_u16(),
-                headers: res_headers.clone(),
-                body_text: body_text.clone(),
+                headers: res_headers,
+                body_text,
                 body_json,
             };
-
-            // Log complete response details
-            self.log_response_details(status, &res_headers, &body_text);
 
             tracing::info!(
                 "HTTP request completed successfully: {} {}",
@@ -349,5 +307,25 @@ impl HttpIntegration {
             );
             return Ok(serde_json::to_string_pretty(&output)?);
         }
+    }
+}
+
+/// Only statuses that define a redirect may trigger another request.
+fn redirect_method(
+    status: reqwest::StatusCode,
+    method: &reqwest::Method,
+) -> Option<reqwest::Method> {
+    use reqwest::{Method, StatusCode};
+    match status {
+        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if *method == Method::POST => {
+            Some(Method::GET)
+        }
+        StatusCode::SEE_OTHER if *method != Method::HEAD => Some(Method::GET),
+        StatusCode::MOVED_PERMANENTLY
+        | StatusCode::FOUND
+        | StatusCode::SEE_OTHER
+        | StatusCode::TEMPORARY_REDIRECT
+        | StatusCode::PERMANENT_REDIRECT => Some(method.clone()),
+        _ => None,
     }
 }

@@ -41,6 +41,9 @@ fn is_public_ipv4(addr: Ipv4Addr) -> bool {
 }
 
 fn is_public_ipv6(addr: Ipv6Addr) -> bool {
+    if let Some(ipv4) = addr.to_ipv4_mapped() {
+        return is_public_ipv4(ipv4);
+    }
     let segments = addr.segments();
     !addr.is_loopback()
         && !addr.is_unspecified()
@@ -65,20 +68,27 @@ async fn validate_url_target(url: &Url) -> anyhow::Result<()> {
     }
 
     let host = url
-        .host_str()
+        .host()
         .ok_or_else(|| anyhow::anyhow!("Blocked: URL is missing a host."))?;
-    if is_allowed_test_host(host) {
+    let host_name = host.to_string();
+    if is_allowed_test_host(&host_name) {
         return Ok(());
     }
-    if host.eq_ignore_ascii_case("localhost") {
-        anyhow::bail!("Blocked: URL targets a local hostname.");
-    }
-
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    let ip = match host {
+        url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
+        url::Host::Domain(_) => None,
+    };
+    if let Some(ip) = ip {
         if !is_public_ip(ip) {
             anyhow::bail!("Blocked: URL targets a local or private IP address.");
         }
         return Ok(());
+    }
+
+    let host = host_name.as_str();
+    if host.eq_ignore_ascii_case("localhost") {
+        anyhow::bail!("Blocked: URL targets a local hostname.");
     }
 
     let port = url.port_or_known_default().unwrap_or(80);

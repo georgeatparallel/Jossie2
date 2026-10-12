@@ -100,12 +100,24 @@ impl HttpIntegration {
             tracing::info!("Body: <empty>");
         } else if body_size > 2000 {
             // Truncate large responses
-            tracing::info!("Body (first 2000 chars): {}", &body_text[..2000]);
-            tracing::info!("Body: ... truncated {} chars ...", body_size - 2000);
+            let preview = body_preview(body_text, 2000);
+            tracing::info!("Body (first {} bytes): {}", preview.len(), preview);
+            tracing::info!(
+                "Body: ... truncated {} bytes ...",
+                body_size - preview.len()
+            );
         } else {
             tracing::info!("Body: {}", body_text);
         }
         tracing::info!("{}", separator);
     }
+}
 
+/// Limit log output without slicing through a UTF-8 code point.
+fn body_preview(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
