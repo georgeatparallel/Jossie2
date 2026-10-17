@@ -297,8 +297,9 @@ hosted `https://search.parallel.ai/mcp` endpoint and does not launch Chrome.
 Omitting `provider`, passing `null`, or selecting `"auto"` keeps the existing
 DuckDuckGo Lite → Brave → DuckDuckGo Instant Answer chain. Selecting `"parallel"`
 reports Parallel errors directly instead of falling back to another provider.
-Parallel calls have a 30-second deadline and use the same Web capability controls
-as other browser tools. Free service limits apply; use `browser_read_page` for
+Each Parallel attempt has a 30-second deadline; the existing tool dispatcher may
+retry transient failures. Searches use the same Web capability controls as other
+browser tools. Free service limits apply; use `browser_read_page` for
 the existing browser-based page reading behavior.
 
 ### HTTP (`jossie-integration-http`)
